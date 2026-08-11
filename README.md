@@ -1,0 +1,671 @@
+# Atlas
+
+> 面向通用任务的 Agent 内核 —— 一套内核，支撑编码 Agent、多 Agent 协作、工作流项目三种形态。
+
+Atlas 提供一个简洁、可控、可演进的通用 Agent 内核。内核只做必要的控制平面（durable 步骤、显式状态、事件溯源、上下文隔离、组合式终止、幂等副作用、预算熔断、OTEL trace），所有"智能"留给上层组合。多 Agent 稳定性来自内核默认开启的护栏；自进化来自分层权限 + 验证基础设施 + 开放式存档。
+
+## 设计原则
+
+- **内核 = 控制平面，上层 = 智能平面**：内核提供确定性骨架与护栏原语，角色/SOP/Prompt/领域工具留给上层。
+- **同一套原语，三种形态**：单 Agent 循环、多 Agent 工作流、编码 Agent 产品都建立在同一套原语之上，不为某种形态做专用抽象。
+- **消除 fallback 触发场景，而非加更多兜底**：失败即退出 + 打印恢复指引，不静默继续。
+- **稳定性来自内核默认开启的护栏**：终止条件、检查点、幂等、预算熔断默认开启，不靠上层自觉。
+- **自进化来自分层权限 + 独立验证**：核心层只读，缓冲层受控可改，自由层沙箱实验。
+- **编排层集成而非重造**：不在图编排上与 LangGraph 正面竞争，工作流原语只做"同一套原语支撑单 Agent 循环和多 Agent 工作流"的最小集；复杂编排场景直接集成 LangGraph/Pydantic AI，内核专注 Durable Execution + Compact + RSI 的差异化组合。
+
+## 工程原则
+
+### EP-1 可用性优先，可放弃技术栈，以运行效果为重
+
+不为了"用某个技术"而用。技术选型以"跑起来、跑得稳"为第一标准，不以"技术先进"为标准。
+
+**工程约束**：
+- 优先纯 Python 方案（Edda/DBOS），不引入外部 server（Temporal/Restate）
+- 不引入 Rust/Go 组件，除非纯 Python 完全无法满足
+- 选最稳定的依赖版本，不追新
+- 遇到技术选型冲突时，以"用户能最快跑通示例"为准
+
+### EP-2 模块完全解耦，可插拔为主
+
+每个模块都能单独拿出来用、单独替换。模块间只通过协议（Protocol）交互，不依赖具体实现。
+
+**工程约束**：
+- 依赖方向严格单向：`atlas-agent → atlas-core → atlas-llm`，绝不反向
+- 对外暴露 Protocol / ABC，不是具体类
+- 具体实现通过配置 + 注册表注入，不 hardcode
+- 每个模块可以独立替换（如 Journal 从 SQLite 换成 PostgreSQL 只需改配置项）
+- 新增能力先写 Protocol，再写实现
+
+### EP-3 组装式构建 + 可视化流程 + 简易 Dashboard
+
+Agent 是搭积木组装的，不是堆叠函数调用写的。运行时能看到执行流程，有网页能观测状态。
+
+**工程约束**：
+- Agent 配置声明式（YAML/JSON），不是 Python 函数调用堆叠
+- 执行过程默认产生 trace + 可视化数据（DAG 节点状态、耗时、输入输出摘要）
+- 内置极简 Dashboard：`python -m atlas dashboard` 一键启动，纯 HTML + WebSocket，不引入 React/Vue 前端工具链
+- Dashboard 展示：运行列表、单 run 流程图（DAG）、工具调用详情、日志面板
+- 可视化能力从 Phase 1 就到位，不后补
+
+### EP-4 用户简单使用为主，不过度复杂，生成用例可评估
+
+用户不需要理解 Durable Execution、Saga 补偿这些概念，就能跑通。每次能力升级都自带示例用例。
+
+**工程约束**：
+- 每个能力在 `examples/` 下都有对应示例脚本，可直接运行
+- 复杂能力（如 Saga 补偿）有"演示模式"——一个示例脚本跑一遍失败→补偿→成功的完整流程
+- 配置文件极简，只暴露必要字段，不暴露 50 个开关
+- 示例脚本自带"预期输出"注释，用户能判断是否符合预期
+- 新增功能必须附带最小可运行示例，没有示例的 PR 不合并
+
+## 架构
+
+```
++--------------------------------------------------------------------+
+|                      atlas-agent（顶层：产品）                       |
+|  多 Agent 编排 / RSI 自进化引擎 / 预设场景（编码/研究/工作流）        |
++--------------------------------------------------------------------+
+                                |
++--------------------------------------------------------------------+
+|                      atlas-core（中层：引擎）                       |
+|  AgentLoop（事件流 + 钩子 + steering）                              |
+|  9 个核心原语（Step/State/Journal/Scope/终止条件/Edge/Suspend/幂等/trace）|
+|  可插拔持久化后端（SQLite 默认 / Temporal 可选）                     |
+|  验证基础设施（Schema 校验 + 独立 Evaluator）                        |
+|  Compact 机制（Summary + Boundary + 状态重注入）                    |
+|  Attachment 机制（程序状态传递给模型）                               |
++--------------------------------------------------------------------+
+                                |
++--------------------------------------------------------------------+
+|                      atlas-llm（底层：模型抽象）                     |
+|  统一 API + provider 预设 / 流式 + Token 追踪 / 重试                 |
++--------------------------------------------------------------------+
+```
+
+依赖方向永远向上，底层对上层一无所知。用户可以只用 `atlas-llm` 调模型，也可以用 `atlas-core` 跑 Agent Loop，完全不需要碰顶层。
+
+## 9 个核心原语
+
+| 优先级 | 原语 | 作用 |
+|---|---|---|
+| P0 | **Step（durable 步骤）** | 包装 LLM/工具调用，输入输出入 journal，崩溃可重放 |
+| P0 | **State（可持久化状态）** | 类型化共享状态，4 层分离（external/workflow/conversation/memory） |
+| P0 | **Journal（执行日志）** | append-only 事件日志，event sourcing 恢复，不是状态快照 |
+| P0 | **Scope（隔离单元）** | 按 key 隔离 Agent 实例，同 key 串行、跨 key 并行 |
+| P0 | **终止条件组合器** | max_iter / timeout / token_budget / cost_cap / repetition_detector 用 \| 组合，默认开启 |
+| P1 | **Edge（控制流边）** | 普通/条件边，表达顺序/分支/循环，用同一套原语表达循环和图 |
+| P1 | **Suspend/Resume（HITL）** | durable 挂起等待外部输入，零成本等待，崩溃不丢 |
+| P1 | **幂等键 + Saga 补偿** | 副作用工具自动注入 idempotency_key，不可幂等动作必须注册补偿 |
+| P2 | **OTEL trace** | 每决策点产 span，trace_id 贯穿 run→subagent→step→tool_call |
+
+## 三大方向
+
+### 方向 1：多 Agent 协同 —— 如何稳定产出
+
+内核提供"确定性骨架 + 局部智能"的原语，上层组合角色和 SOP。
+
+**稳定产出的 5 个关键机制（内核内置）**：
+1. **终止条件默认开启** —— max_iter + timeout + cost_cap 三件套，永不依赖单一信号
+2. **上下文隔离** —— 每个 Worker 独立 Scope，结构化 artifact 传递而非自由文本
+3. **校验门** —— 输出必须通过 Schema 校验 + 独立 Evaluator（不能让 Agent 自评）
+4. **检查点 + 事件溯源** —— 长任务崩溃可断点续跑，不是从头重来
+5. **幂等键 + 补偿** —— 副作用工具调用自动去重，失败有补偿动作
+
+**Subagent = AgentTool + 隔离 Query Loop**：多 Agent 不是另一套内核，而是父 Agent 通过 AgentTool 启动的、拥有隔离上下文的同构 Agent Loop。子 Agent 复用同一套 Runtime，只返回最终结论，不复制内部对话。
+
+### 方向 2：RSI 自进化 —— 安全可控的迭代
+
+分层权限 + 验证基础设施 + 开放式存档。
+
+```
++-------------------------------------+
+| 自由层（沙箱内自由实验）              |
+| - 工具实现代码 / 任务分解策略         |
++-------------------------------------+
+| 缓冲层（受控可改，需通过门控）        |
+| - System Prompt（GEPA 式遗传进化）   |
+| - Skill Library（Voyager 式技能库）  |
+| - 经验记忆（失败案例 > 成功案例）     |
++-------------------------------------+
+| 核心层（永远只读，不可自修改）        |
+| - 价值观宪法 / 安全不变式 / 人类监督钩子 |
++-------------------------------------+
+```
+
+**自进化的 4 个内核原语**：
+- `inspect_self()` —— 读取自身的 system prompt / 工具定义 / Skill 库
+- `propose_diff()` + `evaluate()` —— 生成自修改提案 → 独立验证器打分 → 通过才 apply
+- `archive` —— 开放式存档，保留多样化候选，允许穿越适应度山谷
+- `skill_register/retrieve()` —— 技能三件套（代码+描述+embedding），入库需通过验证
+
+**实施路线**：
+- Phase 1：Skill Library + 失败记忆（上下文层 + 工具层）—— 参考 **Voyager** 技能库模式（Chroma 向量检索 + Critic 验证入库）
+- Phase 2：Prompt 进化（**GEPA** 式反思遗传 + **prompt-evolver** guardrails）+ 工具自生成（沙箱验证）
+- **不做**：权重修改、完全闭环 RSI、**控制流自修改（架构层自改写代码）**—— Darwin Gödel Machine 式架构自修改在 Python 生态无工程化先例，代价过高且上下文层 + 工具层已覆盖 80% RSI 价值
+
+### 方向 3：工作流原语 —— 同一套原语表达两种形态
+
+同一套 Step/State/Edge/Parallel/Suspend/Journal/Scope 原语，既能表达单 Agent 循环，也能表达多 Agent 工作流。
+
+**关键设计**：
+- **Checkpoint ≠ Durable Execution** —— 内核做执行日志（event sourcing/journal），不是状态快照
+- **可插拔持久化后端** —— 开发用 SQLite/内存（零部署），生产接 Temporal/Restate
+- **HITL = durable wait** —— 挂起等待外部输入，崩溃不丢，不用进程内 sleep
+
+## 消息体系
+
+```
+Message
+├── User / Assistant（正常对话）
+├── Tool Use / Tool Result（工具交互）
+├── Attachment（程序补充的运行状态，isMeta=true）
+├── Compact Boundary（压缩边界标记）
+└── Compact Summary（压缩摘要）
+```
+
+**三层消息视角**：
+- **Transcript**（磁盘）—— 完整事件存档，JSONL，树结构（UUID + parentUuid）
+- **Runtime messages**（内存）—— 当前活跃状态，含 Attachment/Boundary/Summary
+- **API messages**（投影）—— 每轮历史投影后发给 LLM 的有效上下文
+
+**Attachment 机制**：程序内部状态传递给模型的标准解法。Attachment 是抽象基类 + 类型注册表，上层按场景注册具体类型（file_state / task_status / skill_list / workflow_state），默认转 system-reminder 文本。内核不硬编码具体类型。
+
+**Compact 机制**：Token 达阈值时触发，调用模型生成 9 段结构化 Summary，创建 Compact Boundary 标记新起点，通过 Attachment 重新注入程序状态（最近文件/Plan/Skills/后台 Task），Summary + 新消息继续对话。
+
+## Tool 层分类与副作用管理
+
+工具按副作用特征分三档，决定是否需要补偿管理：
+
+| 分类 | 标志 | 示例 | 处理方式 |
+|---|---|---|---|
+| 纯查询 | `isReadOnly=True` | read / search / get | 跳过 Saga，重放安全，不记补偿 |
+| 天然幂等 | `isIdempotent=True` | PUT（带版本号）/ DELETE（带 ID） | 走 Journal + 幂等键防重复，不记补偿 |
+| 有副作用且非幂等 | `hasSideEffects=True` + `isIdempotent=False` | 扣款 / 发邮件 / 第三方提交 | **必须实现 `compensate()`**，走完整 Saga |
+
+**Tool 接口（规划中）**：
+
+```python
+class Tool:
+    name: str
+    description: str
+    inputSchema: dict
+    isReadOnly: bool = False           # 纯查询，无副作用
+    isIdempotent: bool = False         # 天然幂等（重放安全）
+    hasSideEffects: bool = False       # 有副作用，需要补偿管理
+    isConcurrencySafe: bool = False    # 是否可并行执行
+
+    def call(self, input, context) -> dict: ...
+
+    def compensate(self, compensate_input, original_result, context) -> dict:
+        """补偿动作。仅 hasSideEffects=True 且非 isIdempotent 时必须实现。"""
+        raise NotImplementedError
+```
+
+## Saga 补偿机制
+
+**核心思想**：不是回滚（rollback），是反向操作（compensating action）—— 扣款 → 退款，发邮件 → 发撤回通知，创建订单 → 取消订单。
+
+**执行流程**：
+
+```
+任务执行：S1 → S2 → S3 → S4 → S5(失败)
+                              ↓
+补偿触发：compensate_all(failed_step_id=S5)
+                              ↓
+反向补偿：compensate(S4) → compensate(S3) → compensate(S2) → compensate(S1)
+          (LIFO 顺序：后执行的先补偿)
+```
+
+**三个关键机制**：
+
+| 机制 | 作用 | 没有它会怎样 |
+|---|---|---|
+| Journal（执行日志） | 记录每步输入输出，知道"跑到哪了" | 不知道从哪恢复，只能从头跑 |
+| 幂等键 | 副作用工具调用自动去重，重放返回首次结果 | 邮件发两次、订单提交两次 |
+| Saga 补偿 | 不可逆操作必须注册反向动作，失败时按 LIFO 顺序补偿 | 无法撤销已执行的不可逆操作 |
+
+**补偿失败的三级处理**（绝不静默忽略）：
+
+```
+Level 1: 自动重试（指数退避，最多 5 次）
+   ↓ 仍失败
+Level 2: 持久化到 Journal + 触发告警（人工介入）
+   ↓
+Level 3: 人工处理后标记 resolved，停止重试
+```
+
+### 日志规范（排查补偿失败）
+
+Saga 补偿涉及资金/订单等不可逆操作，必须保留完整日志链路便于排查。所有 Saga 相关日志统一使用 `structlog` 结构化输出，关键字段：
+
+**执行阶段日志**：
+
+```python
+# 工具执行成功
+log.info("saga.step.execute",
+    run_id=context.run_id,          # 任务运行 ID
+    step_id=context.step_id,        # 步骤 ID
+    tool_name=tool.name,            # 工具名
+    is_readonly=tool.isReadOnly,    # 是否纯查询
+    is_idempotent=tool.isIdempotent, # 是否幂等
+    has_side_effects=tool.hasSideEffects,  # 是否有副作用
+    idempotency_key=key,            # 幂等键（关键）
+    input_summary=_summarize(input), # 输入摘要（脱敏）
+    duration_ms=elapsed,            # 执行耗时
+    status="success",
+)
+
+# 幂等命中（重放时跳过执行）
+log.info("saga.step.idempotent_hit",
+    run_id=context.run_id,
+    step_id=context.step_id,
+    tool_name=tool.name,
+    idempotency_key=key,
+    original_step_id=existing.step_id,  # 首次执行的 step_id
+)
+
+# 工具执行失败
+log.error("saga.step.execute_failed",
+    run_id=context.run_id,
+    step_id=context.step_id,
+    tool_name=tool.name,
+    idempotency_key=key,
+    input_summary=_summarize(input),
+    error=str(e),
+    error_type=type(e).__name__,
+)
+```
+
+**补偿阶段日志**：
+
+```python
+# 补偿开始
+log.warning("saga.compensate.start",
+    run_id=context.run_id,
+    failed_step_id=failed_step_id,
+    pending_compensations=len(self._compensations),
+)
+
+# 单个补偿成功
+log.info("saga.compensate.success",
+    run_id=context.run_id,
+    step_id=record.step_id,         # 被补偿的原始 step
+    tool_name=record.tool_name,
+    compensate_input_summary=_summarize(record.compensate_input),
+    original_result_summary=_summarize(record.result),
+    duration_ms=elapsed,
+)
+
+# 单个补偿失败（关键排查点）
+log.error("saga.compensate.failed",
+    run_id=context.run_id,
+    step_id=record.step_id,
+    tool_name=record.tool_name,
+    compensate_input_summary=_summarize(record.compensate_input),
+    original_result_summary=_summarize(record.result),  # 原始执行结果
+    error=str(e),
+    error_type=type(e).__name__,
+    retry_count=retry_count,        # 第几次重试
+    next_retry_at=next_retry_ts,    # 下次重试时间
+    alert_triggered=True,           # 是否已触发告警
+)
+
+# 补偿全部完成
+log.warning("saga.compensate.complete",
+    run_id=context.run_id,
+    total_compensations=len(results),
+    success_count=sum(1 for r in results if r.status == "success"),
+    failed_count=sum(1 for r in results if r.status == "failed"),
+    failed_steps=[r.step_id for r in results if r.status == "failed"],
+)
+```
+
+**排查补偿失败的标准流程**：
+
+1. 按关键字 `saga.compensate.failed` 搜索日志，定位失败的 step_id
+2. 按 `run_id` + `step_id` 搜索 `saga.step.execute`，找到原始执行的输入输出
+3. 检查 `compensate_input` 是否正确（是否包含退款流水号等关键信息）
+4. 检查 `error_type` 和 `error`，判断是网络问题/权限问题/数据问题
+5. 如补偿已重试 5 次仍失败，检查 Journal 中的 `compensation_failed` 记录，人工介入
+
+## 核心特性（已实现）
+
+- 统一的 LLM / Tool / Memory 接口，能力可插拔
+- 基于 Function Calling 的工具调用与结果回填
+- 多轮会话记忆与结构化 trace 输出
+- **Renderer 可插拔渲染**：内核层 Protocol + PlainRenderer（默认纯文本）+ RichRenderer（终端 Markdown/LaTeX/表格/面板），注入即生效，上层不接触 rich
+- 单 Agent ReAct 循环 + 多 Agent 协作（硬编码 Planner-Worker-Critic demo，Phase 2 会被 `atlas.patterns` 模式包取代）
+- **`spawn_subagent` + `durable_gather` 并行验证 demo**：3 子 Agent 并行 fan-out，父 Agent 汇总，实测加速比 ≈ 2.5x
+- **声明式 Role + 任务 YAML 配置**：Role 三元组（system_prompt + tools + llm_config）与父 Agent/task 统一在 YAML 中声明，改 YAML 即改行为
+- 插件体系：PluginProtocol 10 个生命周期钩子 + PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
+- 5 个 LLM provider 预设（Qwen / OpenAI / Deepseek / Moonshot / 智谱）
+- `atlas init` 一键引导（venv + 依赖安装 + .env 配置）
+
+## 技术栈
+
+- Python 3.11+
+- 依赖管理：`pip` + `venv`（不引入 uv，保持零额外工具依赖）
+- LLM 接入：兼容 OpenAI API 协议的模型均可接入
+- 终端渲染：`rich>=13.0`（RichRenderer），可退化为纯文本
+- 配置：`PyYAML>=6.0`（声明式 Role 与任务配置）
+- 持久化（规划中）：SQLite 默认 / Temporal 可选（可插拔后端）
+
+## 安装与配置
+
+### 一键初始化（推荐）
+
+克隆仓库后，运行一条命令完成虚拟环境创建、依赖安装与 `.env` 配置：
+
+```bash
+# 克隆仓库
+git clone git@github.com:liukun158959-beep/Atlas.git
+cd Atlas
+
+# 一键初始化（venv + 依赖安装 + .env 配置）
+python -m atlas init
+```
+
+`init` 会依次完成：
+1. 在项目根目录创建 `.venv` 虚拟环境
+2. 用 venv 内的 python 执行 `pip install -e .` 安装 atlas
+3. 引导选择 LLM provider（Qwen / OpenAI / Deepseek / Moonshot / 智谱 / 自定义），输入 API Key，自动写入 `.env`
+
+完成后按提示激活 venv 即可运行示例。
+
+### 手动配置（备选）
+
+如果想自己控制 venv 与依赖安装，可跳过 `init` 的前两步，仅手动配置 `.env`：
+
+```bash
+# 复制模板
+cp .env.example .env
+```
+
+编辑 `.env` 填入真实值：
+
+```env
+ATLAS_API_KEY=sk-xxxx
+ATLAS_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+ATLAS_MODEL=qwen-plus
+```
+
+完整 provider 列表与 base_url 见 [.env.example](.env.example)。
+
+## 快速开始
+
+```python
+from dotenv import load_dotenv
+from atlas import Agent, LLM, Toolkit
+from atlas.render import RichRenderer
+from atlas.tools.builtin import BUILTIN_TOOLS
+
+load_dotenv()  # 读取 .env
+
+llm = LLM()
+tools = Toolkit()
+for spec in BUILTIN_TOOLS:  # 注册内置工具：calculator、get_current_time
+    tools.register(**spec)
+
+agent = Agent(
+    llm=llm,
+    tools=tools,
+    system_prompt="你是通用助手 Atlas，遇到需要计算或获取时间的问题请主动调用工具。",
+    # 注入 RichRenderer 即启用终端 Markdown 渲染（粗体/列表/代码块/LaTeX 近似），加 --plain 可退回纯文本
+    renderer=RichRenderer(),
+)
+agent.run("先告诉我现在几点，然后计算 365 * 24 等于多少")
+
+# 查看执行轨迹
+print(agent.trace)
+```
+
+直接运行示例脚本：
+
+```bash
+python examples/quickstart.py                  # 终端 Markdown 渲染
+python examples/quickstart.py --plain          # 纯文本输出（适合重定向到文件）
+```
+
+并行子 Agent 协作示例（声明式 YAML 配置角色 + 任务）：
+
+```bash
+python examples/parallel_subagent_demo.py              # 默认用 examples/parallel_subagent_config.yaml
+python examples/parallel_subagent_demo.py --plain       # 纯文本模式
+```
+
+多 Agent 协作示例（硬编码 Planner-Worker-Critic）：
+
+```bash
+python examples/multi_agent_demo.py
+```
+
+## 项目结构
+
+```
+Atlas/
+├── atlas/                  # 核心源码
+│   ├── core/               # Agent 内核
+│   │   ├── agent.py        # ReAct 循环（内置渲染器注入点）
+│   │   ├── plugin.py       # PluginProtocol + PluginManager
+│   │   └── multi_agent.py  # 多 Agent 协作 demo（硬编码 PWC，Phase 2 迁移到 atlas.patterns）
+│   ├── render/             # 渲染层：Protocol + PlainRenderer + RichRenderer
+│   │   ├── base.py         # Renderer Protocol（5 个方法）
+│   │   ├── plain.py        # 默认纯文本实现（零依赖）
+│   │   └── rich.py         # 基于 rich 的 Markdown/LaTeX/表格/面板渲染
+│   ├── plugins/            # 插件实现
+│   │   ├── token_cost.py   # Token 用量与成本统计插件
+│   │   └── logger.py       # 结构化 JSONL 文件日志插件（按天滚动）
+│   ├── llm/                # LLM 接入层：OpenAI 兼容协议
+│   │   └── base.py
+│   ├── tools/              # 工具基座与内置工具
+│   │   ├── base.py         # Tool / Toolkit
+│   │   └── builtin.py      # calculator / get_current_time
+│   ├── memory/             # 会话记忆
+│   │   └── base.py
+│   ├── context/            # 执行轨迹
+│   │   └── trace.py
+│   ├── cli/                # CLI 子命令
+│   │   └── init.py         # atlas init：venv + 依赖安装 + .env 配置
+│   ├── providers.py        # LLM provider 预设表
+│   └── __main__.py         # CLI 入口：python -m atlas
+├── examples/
+│   ├── quickstart.py       # 快速开始示例（支持 RichRenderer / --plain）
+│   ├── parallel_subagent_demo.py     # spawn_subagent + durable_gather 并行验证 demo
+│   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置
+│   └── multi_agent_demo.py # 硬编码 Planner-Worker-Critic 示例
+├── docs_feishu/            # 飞书文档源文件与二维码临时目录
+├── .env.example            # 配置文件模板
+├── pyproject.toml          # 项目元数据与依赖
+└── README.md
+```
+
+## 路线图
+
+### 已完成（demo 期）
+
+- [x] 内核：Agent 主循环与 ReAct 模式
+- [x] LLM 层：OpenAI 协议兼容接入 + 5 个 provider 预设
+- [x] Tools 层：工具注册与函数调用调度
+- [x] Memory 层：会话记忆
+- [x] 执行轨迹：结构化 trace 输出
+- [x] 多 Agent 协作：Planner-Worker-Critic 模式（demo）
+- [x] 项目初始化：`atlas init` 一键引导
+
+### Phase 1：内核重构（控制平面）
+
+**实现参考**：Journal / Scope / event sourcing 参考 **Edda**（纯 Python、内建 `@on_failure` Saga）和 **DBOS**（进程内库 + SQLite/Postgres）的内嵌式设计，不依赖外部 server；Compact / Transcript 三层拆分参考 **Claude Code** 和 **Pydantic AI v2** 已验证的实现模式。
+
+- [ ] Transcript 三层拆分（Transcript / Runtime / API messages）
+- [ ] Compact 机制（Summary + Boundary + 状态重注入）
+- [ ] 历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）
+- [ ] Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器
+- [ ] Journal（执行日志，event sourcing 恢复）—— 参考 Edda journal 表结构 + DBOS `@step` 重放
+- [ ] Scope（按 key 隔离 Agent 实例）—— 参考 Restate Virtual Object 纯 Python 复刻（per-key lock + DB 状态）
+- [ ] 终止条件组合器（max_iter / timeout / token_budget / cost_cap / repetition_detector）
+- [ ] **插件体系**：`PluginProtocol` + `PluginManager` + 10 个生命周期钩子 + 两个预置插件（`token_cost` 用量统计 / `logger` 结构化日志）—— 预算护栏/Dashboard/Skill Library 都建立在此基础上（对应 EP-2 可插拔）
+- [ ] **声明式 Agent 配置（YAML/JSON）**：组装式构建，支持 plugins/tools/llm 三段声明，不是 Python 函数堆叠（对应 EP-3）
+- [ ] **极简 Dashboard 骨架**：`python -m atlas dashboard` 一键启动，纯 HTML+WebSocket，展示 run 列表 + 单 run DAG 流程图 + 工具调用详情（对应 EP-3）
+
+### Phase 2：多 Agent 稳定性
+
+Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。多 Agent 协作的"角色/SOP/Prompt"不属于内核，内核只提供让上层能稳定组合出任意模式的原语；常见模式（PlannerWorkerCritic / OrchestratorWorkers）作为上层可选包提供，不进内核、不取代用户自定义模式。
+
+#### 2.1 内核原语（控制平面，必做）
+
+- [ ] Tool ABI 增强（inputSchema / validateInput / isReadOnly / isConcurrencySafe）
+- [ ] Hook 机制（PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop）
+- [ ] **Role 抽象**（system_prompt + tools + llm_config 三元组，支持 YAML 声明式 + Python 编程式双轨）—— 角色定义不硬编码在内核，由上层注入
+- [ ] **`spawn_subagent` 内置工具**（durable：子 Agent 调用入 Journal；context 隔离：不复制父对话；artifact schema 校验；支持前台同步 / 后台异步两种模式）
+- [ ] **`durable_gather` 原语**（基于 Journal 的持久化并行 fan-out/gather，幂等防重，崩溃可断点续跑）—— 不重造图编排，仅做"同一套原语支撑并行"的最小集
+- [ ] 幂等键 + Saga 补偿注册
+- [ ] 预算护栏 + 三态熔断器
+- [ ] 独立 Evaluator（校验门，不让 Agent 自评）
+- [ ] **Saga 补偿演示模式**：`examples/saga_demo.py` 一键跑通失败→补偿→成功的完整流程（对应 EP-4）
+- [ ] **Dashboard 增强**：展示补偿日志、重试状态、告警列表（对应 EP-3）
+
+#### 2.2 多 Agent 模式包（上层可选，非内核）
+
+模式包定位为"参考实现 + 可直接组装的产品级模式"，位于 `atlas.patterns`（独立于 `atlas.core`）。用户可以不用这些包、只用内核原语自己组装任意模式；也可以引用其中一种作为起点。模式包之间互不依赖，按需引入。
+
+- [ ] `PlannerWorkerCritic`（最常用模式参考实现：任务分解 → 并行 Worker → Critic 反馈 → 结果聚合，基于 `spawn_subagent` + `durable_gather` 组装）
+- [ ] `OrchestratorWorkers`（Anthropic +90.2% 模式：Orchestrator 动态分派任务给 Worker，结果回 Orchestrator 决策下一步，支持动态增减 Worker）
+- [ ] 每个模式包自带 `examples/<pattern>_demo.py`，含"预期输出"注释，可直接运行验证（对应 EP-4）
+
+**模式包不做的事**：
+- 不内置领域 Prompt / 工具集（用户按场景自己注入）
+- 不替代内核原语，只组合内核原语
+- 不与其他模式包互相耦合，单独可引入
+
+**不在 Phase 2 范围**（留给 Phase 3 工作流原语或上层集成）：
+- 复杂 DAG / 条件分支编排 → 直接集成 LangGraph
+- 长链 Pipeline / 复杂拓扑可视化 → 上层产品职责
+
+### Phase 3：工作流原语
+
+- [ ] Edge（普通/条件边，表达顺序/分支/循环）
+- [ ] Parallel（扇出并行 + and_/or_ 汇聚）
+- [ ] Suspend/Resume（durable HITL，不用进程内 sleep）
+- [ ] 可插拔持久化后端（SQLite 默认 / Temporal 可选）
+
+### Phase 4：RSI 自进化（上下文层 + 工具层）
+
+**实现参考**：Skill Library 参考 **Voyager**（Chroma 向量检索 + trace-extracted 入库闸门）；Prompt 进化参考 **GEPA**（反思式变异 + Pareto 选择）和 **prompt-evolver**（leakage guardrails）；安全分层参考 **OpenHands**（Confirmation Policy + Risk Analyzer + Docker 沙箱）。
+
+- [ ] Skill Library（注册/检索/版本化，三件套：代码+描述+embedding）—— Critic 判定成功才入库，劣质技能不进库
+- [ ] 失败记忆（失败案例 > 成功案例，embedding 检索）—— 对比反思式一次性再生
+- [ ] `inspect_self()` + `propose_diff()` + `evaluate()` + `archive`（上下文层范围：prompt/skill，不改架构）
+- [ ] 分层权限模型（核心层只读 / 缓冲层受控 / 自由层沙箱）—— 高风险动作要求人类确认
+- [ ] Prompt 进化（GEPA 式反思遗传 + leakage guardrails）
+
+### 不做
+
+- 权重自修改（闭源 API 不可行，安全风险不可接受）
+- 完全闭环 RSI（前沿实验室都没实现，治理问题非工程问题）
+- 控制流自修改 / 架构层自改写代码（Darwin Gödel Machine 式，Python 生态无工程化先例，代价过高）
+- TUI / 终端 UI（Atlas 是库不是终端产品）
+- 自建完整 durable execution runtime（做成可插拔后端，不自造）
+- 在图编排上与 LangGraph 正面竞争（复杂编排场景直接集成 LangGraph/Pydantic AI）
+- 内置角色/SOP/Prompt（留给上层，内核只提供控制平面）
+
+## 开发规则
+
+以下是所有代码提交必须遵守的红线，无论贡献者是谁：
+
+### DR-0 依赖方向红线（对应 EP-2）
+
+```
+atlas-llm  严禁导入 atlas-core / atlas-agent
+atlas-core 严禁导入 atlas-agent
+atlas-agent 可以导入所有下层
+```
+
+违反此规则的代码不合并。
+
+### DR-1 接口先行（对应 EP-2）
+
+新增能力的顺序：
+1. 写 Protocol / ABC 定义
+2. 写空实现（raise NotImplementedError）
+3. 写示例用例（`examples/`）
+4. 写具体实现
+5. 跑通示例
+
+跳过任何一步的 PR 不合并。
+
+### DR-2 配置项极限（对应 EP-4）
+
+每个模块的配置项不得超过 **5 个必填 + 10 个可选**。超过时必须：
+- 分拆模块（说明职责过重），或
+- 把多余项下沉到实现层，不暴露给用户
+
+### DR-3 依赖审批（对应 EP-1）
+
+新增第三方依赖必须满足以下任一条件：
+- Python 标准库（零成本）
+- 已在 `pyproject.toml` 中（无需新增）
+- 纯 Python 实现、无二进制依赖、< 100KB、无 transitive 依赖膨胀
+
+否则需在 Issue 中明确论证"为何不使用标准库/已存在依赖"，经审批后才能加入。
+
+### DR-4 示例必附（对应 EP-4）
+
+任何 new feature 提交必须包含：
+- `examples/<feature-name>.py` —— 最小可运行脚本
+- 脚本头部注释写明：**预期行为** + **如何判断成功**
+- 脚本运行无任何外部准备（无需手工建表、手工拷文件），`python examples/xxx.py` 直接跑
+
+### DR-5 日志结构化（对应 Saga 补偿日志规范）
+
+所有 `log.info/warn/error` 必须：
+- 第一个参数是事件名（小写 + 点分隔，如 `saga.step.execute`）
+- 所有上下文用关键字参数传入（不是拼字符串）
+- 不直接打印 `print()`，全部走 `logging`
+
+错误案例：
+```python
+# 错误：拼字符串
+log.info(f"执行步骤 {step_id} 成功，耗时 {elapsed}ms")
+# 错误：print
+print("补偿失败")
+```
+
+正确案例：
+```python
+# 正确：结构化
+log.info("saga.step.execute",
+    run_id=ctx.run_id, step_id=step_id, duration_ms=elapsed, status="success")
+# 正确：走 logging
+log.error("saga.compensate.failed", step_id=step_id, error=str(e))
+```
+
+### DR-6 可插拔性测试（对应 EP-2）
+
+新增后端实现（如 PostgreSQL Journal）必须：
+- 与默认实现（SQLite Journal）通过同一套 Protocol 抽象测试
+- 用户只需改一行配置即可切换
+
+### DR-7 无前端工具链（对应 EP-3）
+
+Dashboard 严禁引入 npm / React / Vue / Webpack 等前端工具链。允许使用：
+- 单 HTML 文件 + 原生 ES Module
+- CDN 引入的轻量库（如 `htmx`、`Chart.js`），不做打包构建
+- Python `http.server` + WebSocket（`websockets` 库）作为服务
+
+### DR-8 命名一致性
+
+- Protocol 后缀：`xxxProtocol`（如 `JournalProtocol`），不用 `Ixxx` 前缀
+- 具体实现：`<特性><Protocol名>`（如 `SQLiteJournal`、`ChromaSkillLibrary`）
+- CLI 子命令：全小写 + 短横线（`atlas init`、`atlas dashboard`）
+- 日志事件名：点分隔（`saga.step.execute`、`dashboard.run.start`）
+
+## 贡献
+
+欢迎通过 Issue 提交问题与建议，或通过 Pull Request 贡献代码。提交前请确保：
+
+- 代码风格一致，注释使用中文
+- 新增能力有对应示例
+- 不引入破坏性 fallback（消除 fallback 触发场景，而非加更多兜底）
+
+## License
+
+MIT

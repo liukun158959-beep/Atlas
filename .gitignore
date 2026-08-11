@@ -1,0 +1,29 @@
+# 环境与配置
+.env
+.venv/
+
+# Python 编译产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 构建产物
+atlas.egg-info/
+dist/
+build/
+*.egg-info/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 运行日志
+*.log
+run_*.log
+
+# 临时文件
+docs_feishu/tmp/
+*.tmp

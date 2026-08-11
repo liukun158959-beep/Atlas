@@ -1,0 +1,59 @@
+# Atlas 并行子 Agent demo 声明式配置
+#
+# 对应 Phase 2 规划的 Role 抽象三元组：system_prompt + tools + llm_config
+# 修改此文件即可调整角色行为，无需改动 demo 代码。
+
+# ==================== 子 Agent 角色定义 ====================
+# 每个角色是一个完整的 Role：system_prompt（身份与输出格式）+ tools（可用工具子集）+ llm_config（模型参数）
+roles:
+
+  researcher:
+    system_prompt: |
+      你是主题调研员。针对给定主题，给出 3 个关键事实 + 1 个结论。
+      输出格式：
+      关键事实:
+      1. ...
+      2. ...
+      3. ...
+      结论: ...
+    tools: [calculator, get_current_time]
+    llm_config:
+      model: qwen-plus
+      temperature: 0.3  # 调研任务允许一定发散
+      max_steps: 5
+
+  calculator_analyst:
+    system_prompt: |
+      你是数值分析员。针对给定计算任务，必须调用 calculator 工具完成计算，
+      然后给出结果解读。输出格式：
+      计算: <表达式>
+      结果: <数值>
+      解读: ...
+    tools: [calculator]
+    llm_config:
+      model: qwen-plus
+      temperature: 0.0  # 计算任务用确定性输出
+      max_steps: 5
+
+# ==================== 父 Agent 配置 ====================
+# 父 Agent 负责编排：识别可并行子任务 → 调用 spawn_subagents → 汇总最终答案
+parent:
+  # system_prompt_template 中的 {known_roles} 占位符在运行时被替换为实际角色列表
+  system_prompt_template: |
+    你是任务编排 Agent。面对可拆解为多个独立子任务的复合任务时，
+    主动调用 spawn_subagents 工具并行启动子 Agent。
+    子 Agent 角色必须从以下枚举中选择，不可自创: {known_roles}。
+    收到子 Agent 的结构化结果后，汇总生成最终答案，不要重复子 Agent 已给出的细节。
+  llm_config:
+    model: qwen-plus
+    temperature: 0.3
+  max_steps: 8
+
+# ==================== 演示任务 ====================
+# 复合任务：3 个互相独立、可并行的子任务
+task: |
+  请帮我完成以下三件事（这些任务互相独立，可以并行处理）：
+  1. 调研 Python 的 GIL 是什么，对多线程有什么影响
+  2. 计算 (1234 * 5678 + 9999) 的结果并解读数值规模
+  3. 调研 asyncio.gather 与 ThreadPoolExecutor 的适用场景差异
+  完成后汇总三件事的关联性。
