@@ -13,6 +13,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from atlas.core.plugin import BasePlugin
+
 log = logging.getLogger("atlas.plugins.token_cost")
 
 # 常用模型的计费表（单位：USD per 1000 tokens）
@@ -39,7 +41,7 @@ USD_TO_CNY = 7.25
 
 
 @dataclass
-class TokenCostPlugin:
+class TokenCostPlugin(BasePlugin):
     """Token 用量与成本统计插件。
 
     Parameters

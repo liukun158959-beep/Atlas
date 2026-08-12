@@ -172,6 +172,63 @@ class PluginProtocol(Protocol):
 
 
 # ----------------------------------------------------------------------
+# 基类：实现所有钩子为 no-op，子类按需覆写
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class BasePlugin:
+    """插件基类：所有钩子默认 no-op，子类只需覆写关心的钩子。
+
+    用法：
+        @dataclass
+        class MyPlugin(BasePlugin):
+            name: str = "my"
+            priority: int = 100
+
+            def on_llm_after_call(self, *, run_id, ...): ...
+    """
+
+    @property
+    def name(self) -> str:
+        return "base"
+
+    @property
+    def priority(self) -> int:
+        return 100
+
+    def on_agent_start(self, *, run_id: str, task: str, context: dict[str, Any]) -> None:
+        pass
+
+    def on_agent_finish(self, *, run_id: str, final_result: str, status: str, context: dict[str, Any]) -> None:
+        pass
+
+    def on_turn_start(self, *, run_id: str, turn_idx: int, context: dict[str, Any]) -> None:
+        pass
+
+    def on_turn_finish(self, *, run_id: str, turn_idx: int, decisions: list[Any], context: dict[str, Any]) -> None:
+        pass
+
+    def on_llm_before_call(self, *, run_id: str, turn_idx: int, model: str, messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> None:
+        pass
+
+    def on_llm_after_call(self, *, run_id: str, turn_idx: int, model: str, response: dict[str, Any], usage: dict[str, int] | None, duration_ms: int) -> None:
+        pass
+
+    def on_tool_before_call(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, input: dict[str, Any]) -> None:
+        pass
+
+    def on_tool_after_call(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, input: dict[str, Any], result: dict[str, Any], duration_ms: int, status: str) -> None:
+        pass
+
+    def on_compensate_start(self, *, run_id: str, failed_step_id: str, compensate_count: int) -> None:
+        pass
+
+    def on_compensate_failed(self, *, run_id: str, step_id: str, tool_name: str, error: str, retry_count: int, next_retry_at: str | None) -> None:
+        pass
+
+
+# ----------------------------------------------------------------------
 # 插件管理器
 # ----------------------------------------------------------------------
 

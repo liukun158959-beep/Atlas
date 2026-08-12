@@ -7,13 +7,20 @@
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+import time
+import uuid
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 from ..context.trace import StepRecord, Trace
+from ..journal.base import JournalEvent, JournalProtocol
 from ..llm.base import LLM
 from ..memory.base import Memory
 from ..render import PlainRenderer, Renderer
 from ..tools.base import Toolkit
+from .plugin import PluginManager
+from .terminator import CompositeTerminator, Terminator, make_default_terminator
 
 if TYPE_CHECKING:
     from .multi_agent import RoleConfig
@@ -29,6 +36,12 @@ class Agent:
         system_prompt: str | None = None,
         max_steps: int = 10,
         renderer: Renderer | None = None,
+        # 终止条件组合器（None 时用 make_default_terminator(max_steps)，行为与旧版一致）
+        terminator: Terminator | None = None,
+        # 插件管理器（None 时用空 PluginManager，emit 无副作用）
+        plugin_manager: PluginManager | None = None,
+        # Journal（None 时不记录事件，不报错）
+        journal: JournalProtocol | None = None,
         # 以下为 Step 2.2 并行子 Agent 新增参数（末尾 + 默认值，不破坏现有调用）
         role_configs: dict[str, "RoleConfig"] | None = None,
         parent_trace: "Trace | None" = None,
@@ -38,6 +51,12 @@ class Agent:
         self.llm = llm
         self.tools = tools
         self.max_steps = max_steps
+        # 终止条件：用户未传则用默认（MaxSteps | Timeout），与旧版行为兼容
+        self.terminator: Terminator = terminator or make_default_terminator(max_steps)
+        # 插件管理器：None 时用空实例（emit 遍历空列表，无副作用）
+        self.plugin_manager: PluginManager = plugin_manager or PluginManager()
+        # Journal：None 时不记录事件
+        self.journal: JournalProtocol | None = journal
         # 渲染器：默认 PlainRenderer（纯文本），注入 RichRenderer 后支持 Markdown
         self.renderer: Renderer = renderer or PlainRenderer()
         self.memory = Memory(system_prompt=system_prompt)
@@ -85,50 +104,229 @@ class Agent:
         if was_empty and self.role_configs and self.auto_inject_spawn_tool:
             self._inject_spawn_tool()
 
+    def _journal_append(self, run_id: str, event_type: str, payload: dict) -> None:
+        """便捷方法：向 Journal 追加事件（若 journal 未注入则跳过）。"""
+        if self.journal:
+            self.journal.append(self.journal.make_event(run_id, event_type, payload))
+
+    def _emit_and_journal(self, run_id: str, event: str, payload: dict, **emit_kwargs: Any) -> None:
+        """便捷方法：同时 emit 插件事件 + 追加 Journal。"""
+        self.plugin_manager.emit(event, run_id=run_id, **emit_kwargs)
+        self._journal_append(run_id, event, payload | {"run_id": run_id} | emit_kwargs)
+
     def run(self, user_input: str) -> str:
         """运行一次任务，返回最终回答。"""
+        # 生成 run_id，贯穿本次执行的所有 emit 和 Journal 事件
+        run_id = str(uuid.uuid4())
+        self.trace.meta["run_id"] = run_id
+
         self.memory.add_user(user_input)
         openai_tools = self.tools.to_openai_tools() or None
 
-        for step_no in range(1, self.max_steps + 1):
-            assistant = self.llm.chat(self.memory.messages, tools=openai_tools)
+        # 插件 + Journal：agent_start
+        sys_msg = next((m["content"] for m in self.memory.messages if m.get("role") == "system"), "")
+        self._emit_and_journal(
+            run_id, "agent_start",
+            payload={"task": user_input},
+            task=user_input,
+            context={"system_prompt": sys_msg},
+        )
+
+        # 终止条件上下文
+        term_ctx = SimpleNamespace(
+            step_count=0,
+            start_time=time.time() * 1000,
+            total_tokens=0,
+            cost_usd=0.0,
+            recent_outputs=[],
+        )
+
+        while True:
+            term_ctx.step_count += 1
+            step_no = term_ctx.step_count
+
+            # 插件：turn_start
+            self._emit_and_journal(
+                run_id, "turn_start",
+                payload={"turn_idx": step_no},
+                turn_idx=step_no,
+                context={},
+            )
+
+            # 终止条件检查（turn_start 之后，llm_before_call 之前）
+            should_stop, reasons = self.terminator.should_stop(term_ctx)
+            if should_stop:
+                final = f"Agent 终止：{'; '.join(reasons)}"
+                self._emit_and_journal(
+                    run_id, "turn_finish",
+                    payload={"turn_idx": step_no, "decisions": []},
+                    turn_idx=step_no,
+                    decisions=[],
+                    context={},
+                )
+                if self.trace._parent_trace is None:
+                    self.trace.render(self.renderer, depth=0)
+                self._emit_and_journal(
+                    run_id, "agent_finish",
+                    payload={"final_result": final, "status": "terminated"},
+                    final_result=final,
+                    status="terminated",
+                    context={"reasons": reasons},
+                )
+                self.renderer.markdown(final, title="终止信息")
+                return final
+
+            # 插件：llm_before_call
+            self._emit_and_journal(
+                run_id, "llm_before_call",
+                payload={"turn_idx": step_no, "model": getattr(self.llm, "model", "")},
+                turn_idx=step_no,
+                model=getattr(self.llm, "model", ""),
+                messages=self.memory.messages,
+                kwargs={"tools": openai_tools} if openai_tools else {},
+            )
+
+            llm_result = self.llm.chat(self.memory.messages, tools=openai_tools)
+            assistant = llm_result["message"]
+            usage = llm_result.get("usage")
+            llm_duration_ms = llm_result.get("duration_ms", 0)
             self.memory.add_assistant(assistant)
+
+            # 累计 token 到终止条件上下文
+            if usage:
+                term_ctx.total_tokens += usage.get("total_tokens", 0)
+
+            # 更新 recent_outputs（供 RepetitionDetector 用）
+            content = assistant.get("content") or ""
+            term_ctx.recent_outputs.append(content)
+            if len(term_ctx.recent_outputs) > 10:
+                term_ctx.recent_outputs.pop(0)
+
+            # 插件：llm_after_call
+            self._emit_and_journal(
+                run_id, "llm_after_call",
+                payload={
+                    "turn_idx": step_no,
+                    "model": getattr(self.llm, "model", ""),
+                    "response": assistant,
+                    "usage": usage,
+                    "duration_ms": llm_duration_ms,
+                },
+                turn_idx=step_no,
+                model=getattr(self.llm, "model", ""),
+                response=assistant,
+                usage=usage,
+                duration_ms=llm_duration_ms,
+            )
+
+            # 从 TokenCostPlugin 累计 cost_usd（若注册了该插件）
+            for p in self.plugin_manager.plugins:
+                if hasattr(p, "per_run") and run_id in getattr(p, "per_run", {}):
+                    term_ctx.cost_usd = p.per_run[run_id].get("cost_usd", 0.0)
 
             tool_calls = assistant.get("tool_calls") or []
             record = StepRecord(
                 step=step_no,
-                thought=assistant.get("content") or "",
+                thought=content,
                 tool_calls=tool_calls,
             )
 
             # 没有工具调用，说明 LLM 已给出最终答案
             if not tool_calls:
                 self.trace.add(record)
-                final = assistant.get("content") or ""
-                # Step 5.2：仅顶层 Agent 自动渲染 Trace（子 Agent 的 trace 由父 Trace 递归渲染，避免重复）
+                final = content
+                # 插件：turn_finish + agent_finish
+                self._emit_and_journal(
+                    run_id, "turn_finish",
+                    payload={"turn_idx": step_no, "decisions": []},
+                    turn_idx=step_no,
+                    decisions=[],
+                    context={},
+                )
                 if self.trace._parent_trace is None:
                     self.trace.render(self.renderer, depth=0)
-                # 用 renderer 输出最终答案（PlainRenderer 退化为 print，RichRenderer 渲染 Markdown）
+                self._emit_and_journal(
+                    run_id, "agent_finish",
+                    payload={"final_result": final, "status": "success"},
+                    final_result=final,
+                    status="success",
+                    context={},
+                )
                 self.renderer.markdown(final, title="最终答案")
                 return final
 
             # 执行所有工具调用，结果回填给 LLM 作为下一步的观察
-            for call in tool_calls:
+            for tool_idx, call in enumerate(tool_calls):
                 fn = call["function"]
+                tool_name = fn["name"]
+                # 解析工具参数
+                if isinstance(fn["arguments"], str):
+                    try:
+                        tool_input = json.loads(fn["arguments"])
+                    except json.JSONDecodeError:
+                        tool_input = {}
+                else:
+                    tool_input = fn["arguments"] or {}
+                step_id = f"{run_id}:{step_no}:{tool_idx}"
+
+                # 插件：tool_before_call
+                self._emit_and_journal(
+                    run_id, "tool_before_call",
+                    payload={
+                        "turn_idx": step_no,
+                        "step_id": step_id,
+                        "tool_name": tool_name,
+                        "input": tool_input,
+                    },
+                    turn_idx=step_no,
+                    step_id=step_id,
+                    tool_name=tool_name,
+                    input=tool_input,
+                )
+
+                tool_start = time.time()
+                tool_status = "success"
                 try:
-                    result = self.tools.execute(fn["name"], fn["arguments"])
+                    result = self.tools.execute(tool_name, fn["arguments"])
                 except Exception as e:
-                    # 工具执行失败是有效信息，回填给 LLM 让其自行调整
                     result = f"工具执行失败: {e}"
+                    tool_status = "failed"
+                tool_duration_ms = int((time.time() - tool_start) * 1000)
+
                 self.memory.add_tool(result, call["id"])
                 record.observations.append(result)
 
+                # 插件：tool_after_call
+                self._emit_and_journal(
+                    run_id, "tool_after_call",
+                    payload={
+                        "turn_idx": step_no,
+                        "step_id": step_id,
+                        "tool_name": tool_name,
+                        "input": tool_input,
+                        "result": {"output": result},
+                        "duration_ms": tool_duration_ms,
+                        "status": tool_status,
+                    },
+                    turn_idx=step_no,
+                    step_id=step_id,
+                    tool_name=tool_name,
+                    input=tool_input,
+                    result={"output": result},
+                    duration_ms=tool_duration_ms,
+                    status=tool_status,
+                )
+
             self.trace.add(record)
 
-        # Step 5.2：超时（max_steps 耗尽）前同样仅顶层渲染
-        if self.trace._parent_trace is None:
-            self.trace.render(self.renderer, depth=0)
-        return f"Agent 在 {self.max_steps} 步内未完成任务。"
+            # 插件：turn_finish
+            self._emit_and_journal(
+                run_id, "turn_finish",
+                payload={"turn_idx": step_no, "decisions": tool_calls},
+                turn_idx=step_no,
+                decisions=tool_calls,
+                context={},
+            )
 
     def reset(self) -> None:
         """重置会话记忆与轨迹，开始新任务。"""

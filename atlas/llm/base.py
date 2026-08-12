@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from openai import OpenAI
@@ -45,10 +46,24 @@ class LLM:
         )
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        """调用对话接口，返回 assistant 消息（dict 形式，便于直接存入 memory）。"""
+        """调用对话接口，返回 {message, usage, duration_ms}。
+
+        - message: assistant 消息 dict（可直接存入 memory）
+        - usage: token 用量 dict（prompt_tokens/completion_tokens/total_tokens），可能为 None
+        - duration_ms: 本次调用耗时（毫秒）
+        """
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
+        start_ts = time.time()
         response = self.client.chat.completions.create(**kwargs)
-        # exclude_none 去掉空字段，避免污染消息历史
-        return response.choices[0].message.model_dump(exclude_none=True)
+        duration_ms = int((time.time() - start_ts) * 1000)
+        message = response.choices[0].message.model_dump(exclude_none=True)
+        usage = None
+        if hasattr(response, "usage") and response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+        return {"message": message, "usage": usage, "duration_ms": duration_ms}

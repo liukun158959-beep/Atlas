@@ -144,7 +144,7 @@ class MultiAgentOrchestrator:
         )
         messages = [{"role": "user", "content": prompt}]
         resp = self.llm.chat(messages)
-        content = resp.get("content") or ""
+        content = resp["message"].get("content") or ""
         # 按行切分，去掉空行
         subtasks = [line.strip() for line in content.split("\n") if line.strip()]
         return subtasks
@@ -166,10 +166,11 @@ class MultiAgentOrchestrator:
         # 简化的 ReAct 循环：最多 3 步工具调用
         for _ in range(3):
             resp = self.llm.chat(messages, tools=openai_tools)
-            messages.append(resp)
-            tool_calls = resp.get("tool_calls") or []
+            msg = resp["message"]
+            messages.append(msg)
+            tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
-                return resp.get("content") or ""
+                return msg.get("content") or ""
             for call in tool_calls:
                 fn = call["function"]
                 try:
@@ -177,7 +178,7 @@ class MultiAgentOrchestrator:
                 except Exception as e:
                     result = f"工具执行失败: {e}"
                 messages.append({"role": "tool", "content": result, "tool_call_id": call["id"]})
-        return resp.get("content") or "执行超时"
+        return msg.get("content") or "执行超时"
 
     def _critic_review(self, subtask: str, result: str) -> tuple[bool, str]:
         """Critic 审查结果，返回 (是否通过, 评语)。"""
@@ -190,7 +191,7 @@ class MultiAgentOrchestrator:
         )
         messages = [{"role": "user", "content": prompt}]
         resp = self.llm.chat(messages)
-        content = resp.get("content") or ""
+        content = resp["message"].get("content") or ""
         first_line = content.split("\n")[0].strip().upper()
         approved = first_line.startswith("PASS")
         comment = "\n".join(content.split("\n")[1:]).strip() or content
@@ -210,7 +211,7 @@ class MultiAgentOrchestrator:
         )
         messages = [{"role": "user", "content": prompt}]
         resp = self.llm.chat(messages)
-        return resp.get("content") or ""
+        return resp["message"].get("content") or ""
 
     def run(self, task: str) -> str:
         """运行完整的多 Agent 协作流程。"""

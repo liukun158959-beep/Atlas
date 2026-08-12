@@ -236,7 +236,7 @@ Level 3: 人工处理后标记 resolved，停止重试
 
 ### 日志规范（排查补偿失败）
 
-Saga 补偿涉及资金/订单等不可逆操作，必须保留完整日志链路便于排查。所有 Saga 相关日志统一使用 `structlog` 结构化输出，关键字段：
+Saga 补偿涉及资金/订单等不可逆操作，必须保留完整日志链路便于排查。所有 Saga 相关日志统一使用 Python 标准 `logging`（配合 `extra={}` 结构化字段）输出，关键字段：
 
 **执行阶段日志**：
 
@@ -440,41 +440,66 @@ python examples/multi_agent_demo.py                     # 默认 RichRenderer
 python examples/multi_agent_demo.py --plain             # 纯文本模式
 ```
 
+Phase 1 地基新能力示例（全部支持 `--mock` 用 FakeLLM 跑逻辑、`--plain` 纯文本）：
+
+```bash
+# Tool ABI 增强：三分类标志 + validate_input 校验
+python examples/tool_abi_demo.py --mock
+
+# Journal event sourcing：12 事件全生命周期 + replay 聚合
+python examples/journal_replay_demo.py --mock --plain
+
+# 终止条件组合器：MaxSteps / Timeout / RepetitionDetector 三种触发
+python examples/terminator_demo.py --mock --plain
+
+# 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
+python examples/plugin_cost_demo.py --mock --plain
+```
+
 ## 项目结构
 
 ```
 Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核
-│   │   ├── agent.py        # ReAct 循环 + role_configs/tool_specs_pool/spawn_subagents 自动注入
+│   │   ├── agent.py        # ReAct 循环 + role_configs/tool_specs_pool/spawn_subagents/terminator/plugin_manager/journal 注入
+│   │   ├── terminator.py   # 终止条件组合器：MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector，| 运算符组合
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather + make_spawn_subagents_tool
-│   │   ├── orchestrator.py # Planner-Worker-Critic 多 Agent 协作编排器
-│   │   └── plugin.py       # PluginProtocol + PluginManager
+│   │   ├── orchestrator.py # Planner-Worker-Critic 多 Agent 协作编排器（Renderer 统一渲染）
+│   │   └── plugin.py       # PluginProtocol + PluginManager + BasePlugin（钩子 no-op 基类）
+│   ├── journal/            # 执行日志 event sourcing
+│   │   └── base.py         # JournalProtocol + JournalEvent + InMemoryJournal（摘要模式默认，opt-in 全量）
+│   ├── utils/              # 工具函数
+│   │   └── yaml_loader.py  # load_parallel_subagent_config()：YAML → RoleConfig + parent + task
 │   ├── render/             # 渲染层：Protocol + PlainRenderer + RichRenderer
 │   │   ├── base.py         # Renderer Protocol（5 个方法）
 │   │   ├── plain.py        # 默认纯文本实现（零依赖）
 │   │   └── rich.py         # 基于 rich 的 Markdown/LaTeX/表格/面板渲染
-│   ├── plugins/            # 插件实现
-│   │   ├── token_cost.py   # Token 用量与成本统计插件
-│   │   └── logger.py       # 结构化 JSONL 文件日志插件（按天滚动）
+│   ├── plugins/            # 插件实现（继承 BasePlugin 即可，按需覆写钩子）
+│   │   ├── token_cost.py   # Token 用量与成本统计插件（含 28 个模型单价表）
+│   │   └── logger.py       # 结构化 JSONL 文件日志插件（按天滚动 + 按 run 拆目录）
 │   ├── llm/                # LLM 接入层：OpenAI 兼容协议
-│   │   └── base.py
+│   │   └── base.py         # chat() 返回 {message, usage, duration_ms} 三层结构
 │   ├── tools/              # 工具基座与内置工具
-│   │   ├── base.py         # Tool（含 parameters_factory 懒加载） / Toolkit
-│   │   └── builtin.py      # calculator / get_current_time
+│   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + validate_input + parameters_factory）/ Toolkit
+│   │   └── builtin.py      # calculator / get_current_time（均标记 isReadOnly=True）
 │   ├── memory/             # 会话记忆
 │   │   └── base.py
 │   ├── context/            # 执行轨迹
-│   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套
+│   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套 + Trace.meta
 │   ├── cli/                # CLI 子命令
 │   │   └── init.py         # atlas init：venv + 依赖安装 + .env 配置
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
 │   ├── quickstart.py       # 快速开始示例（支持 RichRenderer / --plain）
-│   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（纯内核 API，< 100 行）
-│   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置
-│   └── multi_agent_demo.py # Planner-Worker-Critic 示例（Renderer 统一渲染）
+│   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（YAML 声明式配置，< 120 行，--config 可指定）
+│   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置（被 yaml_loader 读取）
+│   ├── multi_agent_demo.py # Planner-Worker-Critic 示例（Renderer 统一渲染）
+│   ├── tool_abi_demo.py    # Tool ABI 增强：三分类标志 + validate_input 通过/失败演示
+│   ├── journal_replay_demo.py  # Journal event sourcing：12 事件全生命周期 + replay 聚合
+│   ├── terminator_demo.py  # 终止条件组合器：MaxSteps/Timeout/RepetitionDetector 三种触发
+│   └── plugin_cost_demo.py # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -501,11 +526,11 @@ Atlas/
 - [ ] Compact 机制（Summary + Boundary + 状态重注入）
 - [ ] 历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）
 - [ ] Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器
-- [ ] Journal（执行日志，event sourcing 恢复）—— 参考 Edda journal 表结构 + DBOS `@step` 重放
+- [x] **Journal（执行日志，event sourcing 恢复）**—— `InMemoryJournal` + `JournalProtocol`（SQLite 实现预留）；事件结构折中（壳 dataclass + 自由 payload dict）；摘要模式默认 mask 敏感字段 + 截断 200 字，`save_full_payload=True` opt-in 全量
 - [ ] Scope（按 key 隔离 Agent 实例）—— 参考 Restate Virtual Object 纯 Python 复刻（per-key lock + DB 状态）
-- [ ] 终止条件组合器（max_iter / timeout / token_budget / cost_cap / repetition_detector）
-- [ ] **插件体系**：`PluginProtocol` + `PluginManager` + 10 个生命周期钩子 + 两个预置插件（`token_cost` 用量统计 / `logger` 结构化日志）—— 预算护栏/Dashboard/Skill Library 都建立在此基础上（对应 EP-2 可插拔）
-- [ ] **声明式 Agent 配置（YAML/JSON）**：组装式构建，支持 plugins/tools/llm 三段声明，不是 Python 函数堆叠（对应 EP-3）
+- [x] **终止条件组合器**（MaxSteps / Timeout / TokenBudget / CostCap / RepetitionDetector）—— `|` 运算符组合，`CompositeTerminator` 任一命中即终止；默认 `MaxSteps(10) | Timeout(60_000)` 与旧版完全兼容
+- [x] **插件体系（接入 Agent 全生命周期）**：`PluginProtocol` + `PluginManager` + `BasePlugin` 钩子基类（子类按需覆写 no-op）；10 个生命周期 + UUID run_id + 全链路 step_id；预置 `TokenCostPlugin` / `FileLoggerPlugin` 真实工作
+- [x] **声明式 YAML Loader**：`atlas.utils.yaml_loader.load_parallel_subagent_config()` 严格模式（缺字段抛 RuntimeError，不兜底）；`parallel_subagent_demo.py` 默认读 YAML，支持 `--config`
 - [ ] **极简 Dashboard 骨架**：`python -m atlas dashboard` 一键启动，纯 HTML+WebSocket，展示 run 列表 + 单 run DAG 流程图 + 工具调用详情（对应 EP-3）
 
 ### Phase 2：多 Agent 稳定性
@@ -514,13 +539,13 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 
 #### 2.1 内核原语（控制平面，必做）
 
-- [ ] Tool ABI 增强（inputSchema / validateInput / isReadOnly / isConcurrencySafe）
-- [ ] Hook 机制（PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop）
+- [x] **Tool ABI 增强（分类标志 + validateInput）**—— 三标志（`isReadOnly`/`isIdempotent`/`hasSideEffects`，默认全 False）；注册时 `isReadOnly=True` 自动强制幂等，`hasSideEffects+非幂等` 打 warning；`Tool.validate_input()` 走 `jsonschema`；`isConcurrencySafe`/`compensate()` 留后续 Saga 阶段
+- [x] **Hook 机制（插件 10 生命周期）**—— `on_agent_start/finish`、`on_turn_start/finish`、`on_llm_before/after_call`、`on_tool_before/after_call`、`on_compensate_start/failed`；`BasePlugin` no-op 基类，子类按需覆写；配合 `run_id`（UUID）+ `step_id` 全链路可追溯
 - [x] **Role 抽象**（`RoleConfig`：system_prompt + tool_names + temperature/max_steps/timeout_ms 三元组，Python 编程式注入，YAML 声明式由上层 `parallel_subagent_config.yaml` 承载）—— 角色定义不硬编码在内核，由上层注入
 - [x] **`spawn_subagents` 内置工具**（`make_spawn_subagents_tool` 闭包工厂 + `_inject_spawn_tool` 自动注入 + role enum 懒加载 + 嵌套守卫双保险；context 隔离：子 Agent 独立 Memory/Trace；artifact schema 校验：`jsonschema.validate` 不改写原文仅打标记）
 - [x] **`parallel_gather` 原语**（ThreadPoolExecutor 并行 fan-out/gather + enumerate O(1) 顺序保持 + partial success 错误隔离 + 并行效率 meta）—— 持久化/幂等防重留给 Journal 原语
+- [x] **预算护栏（terminator 侧可触发）**—— `CostCap(max_usd)` + `TokenBudget(max_tokens)` 终止条件；`TokenCostPlugin` 累计 `cost_usd` 写入 `_term_ctx`；三态熔断器留后续 Phase 2.2
 - [ ] 幂等键 + Saga 补偿注册
-- [ ] 预算护栏 + 三态熔断器
 - [ ] 独立 Evaluator（校验门，不让 Agent 自评）
 - [ ] **Saga 补偿演示模式**：`examples/saga_demo.py` 一键跑通失败→补偿→成功的完整流程（对应 EP-4）
 - [ ] **Dashboard 增强**：展示补偿日志、重试状态、告警列表（对应 EP-3）

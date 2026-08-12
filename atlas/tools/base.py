@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Callable
+
+import jsonschema
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -14,9 +19,21 @@ class Tool:
     description: str
     parameters: dict  # JSON Schema 描述参数（静态默认值，首次注册占位）
     func: Callable[[dict], str]  # 接收参数字典，返回字符串结果
-    # Step 2.3 新增：Q19 schema 懒加载 factory。
+    # Q19 schema 懒加载 factory。
     # 非 None 时，Toolkit.to_openai_tools() 每轮调用重新生成 parameters（如 role enum 动态更新）。
     parameters_factory: Callable[[], dict] | None = None
+    # Phase 1 Tool ABI 增强：三分类标志，用于 Saga 补偿分类决策
+    isReadOnly: bool = False  # 纯查询，无副作用
+    isIdempotent: bool = False  # 天然幂等（重放安全）
+    hasSideEffects: bool = False  # 有副作用，需要补偿管理
+
+    def validate_input(self, input: dict) -> None:
+        """用 JSON Schema 校验输入参数，校验失败抛 jsonschema.ValidationError。"""
+        schema = self.parameters
+        if not schema and self.parameters_factory:
+            schema = self.parameters_factory()
+        if schema:
+            jsonschema.validate(instance=input, schema=schema)
 
 
 class Toolkit:
@@ -31,11 +48,36 @@ class Toolkit:
         name: str,
         description: str,
         parameters: dict,
+        isReadOnly: bool = False,
+        isIdempotent: bool = False,
+        hasSideEffects: bool = False,
     ) -> Tool:
-        """注册一个工具，重名时直接报错（消除命名冲突的模糊性）。"""
+        """注册一个工具，重名时直接报错（消除命名冲突的模糊性）。
+
+        三分类标志约束：
+        - isReadOnly=True 自动强制 isIdempotent=True（纯查询天然幂等）
+        - hasSideEffects=True 且 isIdempotent=False 打 warning（后续 Saga 需要补偿）
+        """
         if name in self._tools:
             raise ValueError(f"工具已存在: {name}")
-        tool = Tool(name=name, description=description, parameters=parameters, func=func)
+        # 纯查询天然幂等，自动修正
+        if isReadOnly and not isIdempotent:
+            isIdempotent = True
+        # 有副作用且非幂等，提醒后续需要注册补偿
+        if hasSideEffects and not isIdempotent:
+            _log.warning(
+                "tool.side_effects_non_idempotent",
+                extra={"tool_name": name, "hint": "后续 Saga 补偿需注册 compensate()"},
+            )
+        tool = Tool(
+            name=name,
+            description=description,
+            parameters=parameters,
+            func=func,
+            isReadOnly=isReadOnly,
+            isIdempotent=isIdempotent,
+            hasSideEffects=hasSideEffects,
+        )
         self._tools[name] = tool
         return tool
 

@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from atlas.core.plugin import BasePlugin
+
 log = logging.getLogger("atlas.plugins.logger")
 
 
@@ -38,7 +40,7 @@ def _safe_serialize(obj: Any) -> Any:
 
 
 @dataclass
-class FileLoggerPlugin:
+class FileLoggerPlugin(BasePlugin):
     """结构化落盘插件。
 
     每条事件写成标准 JSONL 格式（一行一个 JSON）：

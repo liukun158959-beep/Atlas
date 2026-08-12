@@ -73,6 +73,7 @@ BUILTIN_TOOLS = [
             },
             "required": ["expression"],
         },
+        "isReadOnly": True,
     },
     {
         "func": get_current_time,
@@ -88,5 +89,6 @@ BUILTIN_TOOLS = [
             },
             "required": [],
         },
+        "isReadOnly": True,
     },
 ]
