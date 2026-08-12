@@ -517,13 +517,14 @@ assert ok, reasons
 ```
 Atlas/
 ├── atlas/                  # 核心源码
-│   ├── core/               # Agent 内核
-│   │   ├── agent.py        # ReAct 循环 + role_configs/tool_specs_pool/spawn_subagents/terminator/plugin_manager/journal 注入 + 幂等键 cache 命中跳过 + SagaStack LIFO 补偿 + compensate_* 三插件钩子
-│   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol + ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用）
-│   │   ├── terminator.py   # 终止条件组合器：MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector，| 运算符组合
-│   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather + make_spawn_subagents_tool
+│   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿）
+│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；compensate_* 三插件钩子
+│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（10 钩子 no-op 基类；Phase 2.1 新增 on_compensate_start/finish/failed 共 13 钩子）
+│   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()（MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector）
+│   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol（@runtime_checkable）+ ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用，Agent 不自评）
+│   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
 │   │   ├── orchestrator.py # Planner-Worker-Critic 多 Agent 协作编排器（Renderer 统一渲染）
-│   │   └── plugin.py       # PluginProtocol + PluginManager + BasePlugin（钩子 no-op 基类）
+│   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire(key) context manager）
 │   ├── journal/            # 执行日志 event sourcing
 │   │   └── base.py         # JournalProtocol 扩 cache_get/cache_set + JournalEvent + InMemoryJournal（摘要模式默认，opt-in 全量 + _cache 幂等存储）
 │   ├── utils/              # 工具函数（Phase 2.1 扩展：幂等键 + 副作用追踪器）
@@ -542,13 +543,6 @@ Atlas/
 │   ├── tools/              # 工具基座与内置工具
 │   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + compensate 字段 + validate_input + parameters_factory）/ Toolkit.register() 升级补偿约束为 ValueError 拒绝
 │   │   └── builtin.py      # calculator / get_current_time（均标记 isReadOnly=True）
-│   ├── core/               # Agent 内核 + 9 原语
-│   │   ├── agent.py        # Agent.run() ReAct 循环：tool_call 执行 → Terminator → Plugin 10 钩子 → Journal 事件 + step 计数；compact_threshold + compact_manager + transcript 接入
-│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（10 钩子 no-op 基类）
-│   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()
-│   │   ├── evaluator.py    # Evaluator Protocol + ArtifactSchemaEvaluator（内核外 JSON Schema 契约校验）
-│   │   ├── multi_agent.py  # SubagentSpec/RoleConfig/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）
-│   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire() context manager）
 │   ├── memory/             # 会话记忆
 │   │   └── base.py         # Phase 1 改造：messages 改 @property + _runtime_messages + project() 五步投影 + token 跟踪 + add_attachment()/add_summary()
 │   ├── context/            # 执行轨迹与上下文（Phase 1 扩 4 文件）
