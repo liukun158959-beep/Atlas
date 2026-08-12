@@ -168,9 +168,14 @@ Message
 - **Runtime messages**（内存）—— 当前活跃状态，含 Attachment/Boundary/Summary
 - **API messages**（投影）—— 每轮历史投影后发给 LLM 的有效上下文
 
-**Attachment 机制**：程序内部状态传递给模型的标准解法。Attachment 是抽象基类 + 类型注册表，上层按场景注册具体类型（file_state / task_status / skill_list / workflow_state），默认转 system-reminder 文本。内核不硬编码具体类型。
+**Attachment 机制（已实现）**：`atlas.context.Attachment` 抽象基类 + `AttachmentRegistry` 字典注册表（重名 ValueError 拒绝）；子类覆写 `to_system_reminder()` 返回 system-reminder 文本；Runtime 层消息标记 `isMeta=True, type=attachment`；`project()` 时转成普通 `role=system` 消息插入 API messages，不会污染 LLM。上层按场景注册具体类型（file_state / task_status / skill_list / workflow_state），内核不硬编码任何具体类型。提供 `Memory.add_attachment(attachment)` 便捷方法。
 
-**Compact 机制**：Token 达阈值时触发，调用模型生成 9 段结构化 Summary，创建 Compact Boundary 标记新起点，通过 Attachment 重新注入程序状态（最近文件/Plan/Skills/后台 Task），Summary + 新消息继续对话。
+**Compact 机制（已实现）**：
+- **触发条件**：默认 `compact_threshold=8000`（Agent 参数，`None` 禁用）。每次 LLM 调用后从 `usage.prompt_tokens` 读取真实 token 数 → `memory.update_token_count()` → 超阈值时 `CompactManager.compact()` 自动触发。
+- **生成 9 段 Summary**：构造 9 段模板 prompt（用户目标/已完成步骤/关键发现/当前状态/待办事项/关键文件资源/错误与教训/决策记录/下一步建议）→ 复用 Agent 的 LLM 生成 Summary 文本（无 LLM 时退化为规则提取）。
+- **写入 Summary + Boundary 对**：`memory.add_summary()` 依次写入 `type=compact_summary`（assistant role, isMeta=True）+ `type=compact_boundary`（system role, isMeta=True）两条消息；同时重置 `memory.reset_token_count()`（下次从 Boundary 后重新累计）。
+- **project() 投影**：找最后一个 Boundary → 保留 system prompt + Summary + Boundary 之后的消息 → isMeta 过滤（Attachment 转 system，Summary 转 assistant，Boundary 跳过）→ 修 tool_call 配对 → 超阈值从最旧 user/assistant 对裁剪到阈值 × 0.7。
+- **Transcript 双写**：Memory 写入同时 `agent.transcript.append()`，append-only 事件存档 + JSONL 导出/恢复（`transcript.to_jsonl(path)` / `Transcript.from_jsonl(path)`）。
 
 ## Tool 层分类与副作用管理
 
@@ -352,6 +357,11 @@ log.warning("saga.compensate.complete",
 - **幂等键 + Saga 补偿注册（Phase 2.1 收尾）**：`atlas.utils.derive_idempotency_key(run_id, tool_name, input_dict)` 派生 40 位 SHA-1；工具输入支持 `_idempotency_key` 魔法字段显式覆盖；Journal 扩展 `cache_get/cache_set` 持久化幂等结果；Agent 无最终答案时 LIFO 反向补偿已成功入栈的非幂等副作用工具；幂等命中不进 saga_stack
 - **独立 Evaluator（校验门，Phase 2.1 收尾）**：内核外 Protocol + 内置 `ArtifactSchemaEvaluator` JSON Schema 契约校验；用户在 `agent.run(task)` 之后独立调用 `evaluator.evaluate(result, events)`，不从内核中自评；顶层 `from atlas import Evaluator, ArtifactSchemaEvaluator` 直接用
 - **SideEffectTracker demo 辅助**：`atlas.utils.SideEffectTracker` record/erase/exists/is_empty；配合 `examples/saga_demo.py` 断言 Saga 补偿后所有副作用记录 100% 清零（无残留）
+- **Memory 分层 + 历史投影层 project()（Phase 1 第一批）**：`Memory.messages` 从 list 属性改为 `@property`，每次访问返回 project() 投影结果；内部 `_runtime_messages` 存原始数据（含 isMeta Attachment/Boundary/Summary）。project() 五步流水线：找最后一个 Boundary → 保留 system prompt + Summary + Boundary 之后消息 → isMeta 过滤（Attachment→system、Boundary→跳过、Summary→assistant）→ 修 tool_call 配对（删除断裂 tool_calls 和无配对 tool 消息）→ 超阈值从最旧 user/assistant 对裁剪到 threshold×0.7
+- **Attachment 抽象基类 + 类型注册表（Phase 1 第一批）**：`atlas.context.Attachment` ABC + `AttachmentRegistry.register(name,cls)/create(name,kwargs)`；重名 TypeError 子类校验 + ValueError 拒绝；`add_attachment(attachment)` / `to_message()` 便捷写入；顶层 `from atlas import Attachment, AttachmentRegistry`
+- **Compact 机制（Phase 1 第一批）**：`CompactManager(threshold=8000, llm=agent.llm)`（复用主 LLM，不额外配置）；`should_compact(token_count)` 阈值判断；`compact()` 生成 9 段 Summary；Agent `compact_threshold` 参数默认 8000（None 禁用）；顶层 `from atlas import CompactManager`
+- **Transcript 磁盘层（Phase 1 第一批）**：`atlas.context.Transcript` append-only 事件存档；Agent 默认创建，`agent.transcript` 直接访问；Memory 写入点（user/assistant/tool/compact）全部双写 transcript.append；`replay()` 全量返回；`to_jsonl(path)/from_jsonl(path)` JSONL 导出恢复；顶层 `from atlas import Transcript`
+- **compact_demo.py（Phase 1 第一批 demo）**：`--mock` 模式下 CompactFakeLLM 逐轮递增 token（3000→5000→7000→8500→3000），第 4 轮必触发 compact；5 项断言（summary/boundary 存在/project 13→4 条/无 isMeta/Transcript 5+5+1 事件）；真实 LLM 模式 soft 检查（不强制断言，提示加 --mock）
 
 ## 技术栈
 
@@ -470,6 +480,10 @@ python examples/plugin_cost_demo.py --mock --plain
 # Phase 2.1 收尾：幂等键命中跳过 + Saga LIFO 补偿（write_po + charge 成功 → ship FAIL-SHIP-500 → 终止 → 补偿清零）
 # 100% 可复现；末尾自带 SideEffectTracker.is_empty() 断言
 python examples/saga_demo.py --mock --plain
+
+# Phase 1 第一批：Compact 机制（9 段 Summary + Boundary + Transcript + project 投影）
+# --mock 必触发 compact（第 4 轮 token=8500 > 8000），5 项断言全通过
+python examples/compact_demo.py --mock --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -515,8 +529,11 @@ Atlas/
 │   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + compensate 字段 + validate_input + parameters_factory）/ Toolkit.register() 升级补偿约束为 ValueError 拒绝
 │   │   └── builtin.py      # calculator / get_current_time（均标记 isReadOnly=True）
 │   ├── memory/             # 会话记忆
-│   │   └── base.py
-│   ├── context/            # 执行轨迹
+│   │   └── base.py         # Phase 1 改造：messages 改 @property + _runtime_messages + project() 五步投影 + token 跟踪 + add_attachment()/add_summary()
+│   ├── context/            # 执行轨迹与上下文（Phase 1 扩 4 文件）
+│   │   ├── attachment.py   # Phase 1 新增：Attachment ABC + AttachmentRegistry（register/create 模式，重名 ValueError 拒绝）
+│   │   ├── transcript.py   # Phase 1 新增：Transcript append-only 事件存档 + JSONL 导出/恢复，与 Memory 双写
+│   │   ├── compact.py      # Phase 1 新增：CompactManager（9 段 Summary + should_compact 阈值判断 + LLM/规则双模式）
 │   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套 + Trace.meta
 │   ├── cli/                # CLI 子命令
 │   │   └── init.py         # atlas init：venv + 依赖安装 + .env 配置
@@ -531,7 +548,8 @@ Atlas/
 │   ├── tool_abi_demo.py    # Tool ABI 增强：三分类标志 + validate_input 通过/失败演示 + compensate 注册
 │   ├── journal_replay_demo.py  # Journal event sourcing：12 事件全生命周期 + replay 聚合
 │   ├── terminator_demo.py  # 终止条件组合器：MaxSteps/Timeout/RepetitionDetector 三种触发
-│   └── plugin_cost_demo.py # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
+│   ├── plugin_cost_demo.py # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
+│   └── compact_demo.py     # Phase 1 新增：Compact 机制演示（--mock 第 4 轮 token=8500 触发，5 项断言）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -554,12 +572,12 @@ Atlas/
 
 **实现参考**：Journal / Scope / event sourcing 参考 **Edda**（纯 Python、内建 `@on_failure` Saga）和 **DBOS**（进程内库 + SQLite/Postgres）的内嵌式设计，不依赖外部 server；Compact / Transcript 三层拆分参考 **Claude Code** 和 **Pydantic AI v2** 已验证的实现模式。
 
-- [ ] Transcript 三层拆分（Transcript / Runtime / API messages）
-- [ ] Compact 机制（Summary + Boundary + 状态重注入）
-- [ ] 历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）
-- [ ] Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器
+- [x] **Transcript 三层拆分（Transcript / Runtime / API messages）**—— Transcript（append-only 事件存档 + JSONL）/ Memory._runtime_messages（原始数据，含 isMeta）/ Memory.messages @property（project() 投影，返回干净的 API messages）
+- [x] **Compact 机制（Summary + Boundary + 状态重注入）**—— CompactManager；默认 threshold=8000；9 段结构化 Summary 复用 Agent LLM 生成；type=compact_summary + type=compact_boundary 消息对；Attachment 作为未来 state re-injection 载体已就绪
+- [x] **历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）**—— 五步流水线：找最后 compact_boundary → 保留 system prompt + Summary + Boundary 后消息 → isMeta 分层转换（Attachment→system / Summary→assistant / Boundary→跳过）→ tool_call 配对修复（删除断裂 tool_calls 和无配对 tool 消息）→ 超阈值裁剪最旧 user/assistant 对到 target=threshold×0.7
+- [x] **Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器**—— Attachment ABC + AttachmentRegistry（register/create 模式）；重名 ValueError 拒绝 + TypeError 子类校验；to_system_reminder() 子类覆写 + to_message() Runtime 消息生成；Memory.add_attachment() 便捷写入
 - [x] **Journal（执行日志，event sourcing 恢复）**—— `InMemoryJournal` + `JournalProtocol`（SQLite 实现预留）；事件结构折中（壳 dataclass + 自由 payload dict）；摘要模式默认 mask 敏感字段 + 截断 200 字，`save_full_payload=True` opt-in 全量
-- [ ] Scope（按 key 隔离 Agent 实例）—— 参考 Restate Virtual Object 纯 Python 复刻（per-key lock + DB 状态）
+- [ ] Scope（按 key 隔离 Agent 实例）—— 参考 Restate Virtual Object 纯 Python 复刻（per-key threading.Lock + 内存状态；context manager acquire(key)；未来 SQLite 持久化后端可插拔）
 - [x] **终止条件组合器**（MaxSteps / Timeout / TokenBudget / CostCap / RepetitionDetector）—— `|` 运算符组合，`CompositeTerminator` 任一命中即终止；默认 `MaxSteps(10) | Timeout(60_000)` 与旧版完全兼容
 - [x] **插件体系（接入 Agent 全生命周期）**：`PluginProtocol` + `PluginManager` + `BasePlugin` 钩子基类（子类按需覆写 no-op）；10 个生命周期 + UUID run_id + 全链路 step_id；预置 `TokenCostPlugin` / `FileLoggerPlugin` 真实工作
 - [x] **声明式 YAML Loader**：`atlas.utils.yaml_loader.load_parallel_subagent_config()` 严格模式（缺字段抛 RuntimeError，不兜底）；`parallel_subagent_demo.py` 默认读 YAML，支持 `--config`

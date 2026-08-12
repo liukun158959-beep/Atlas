@@ -13,7 +13,9 @@ import uuid
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from ..context.compact import CompactManager
 from ..context.trace import StepRecord, Trace
+from ..context.transcript import Transcript
 from ..journal.base import JournalEvent, JournalProtocol
 from ..llm.base import LLM
 from ..memory.base import Memory
@@ -48,6 +50,9 @@ class Agent:
         parent_trace: "Trace | None" = None,
         auto_inject_spawn_tool: bool = True,
         tool_specs_pool: list[dict] | None = None,
+        # Phase 1 compact：token 超阈值自动 compact（None 禁用）
+        compact_threshold: int | None = 8000,
+        transcript: Transcript | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -60,7 +65,16 @@ class Agent:
         self.journal: JournalProtocol | None = journal
         # 渲染器：默认 PlainRenderer（纯文本），注入 RichRenderer 后支持 Markdown
         self.renderer: Renderer = renderer or PlainRenderer()
-        self.memory = Memory(system_prompt=system_prompt)
+        # Phase 1 compact：Memory 内部分层 + project() 投影
+        self.compact_threshold = compact_threshold
+        self.memory = Memory(system_prompt=system_prompt, compact_threshold=compact_threshold)
+        # CompactManager：token 超阈值时调 LLM 生成 Summary（None 禁用）
+        self.compact_manager: CompactManager | None = (
+            CompactManager(threshold=compact_threshold, llm=llm)
+            if compact_threshold else None
+        )
+        # Transcript：append-only 全量事件存档（与 Memory 双写）
+        self.transcript: Transcript = transcript or Transcript()
         self.trace = Trace()
         # Step 2.2 并行子 Agent 字段
         self.role_configs: dict[str, RoleConfig] = role_configs or {}
@@ -126,6 +140,7 @@ class Agent:
         _compensate_failed: list[tuple[str, str, str]] = []  # (step_id, tool_name, error_str)
 
         self.memory.add_user(user_input)
+        self.transcript.append({"role": "user", "content": user_input})
         openai_tools = self.tools.to_openai_tools() or None
 
         # 插件 + Journal：agent_start
@@ -236,6 +251,18 @@ class Agent:
             usage = llm_result.get("usage")
             llm_duration_ms = llm_result.get("duration_ms", 0)
             self.memory.add_assistant(assistant)
+            self.transcript.append(assistant)
+
+            # Phase 1 compact：token 超阈值时调 LLM 生成 Summary + Boundary
+            if usage and self.compact_manager:
+                self.memory.update_token_count(usage.get("prompt_tokens", 0))
+                if self.compact_manager.should_compact(self.memory.get_token_count()):
+                    summary = self.compact_manager.compact(
+                        self.memory.runtime_messages, self.trace
+                    )
+                    self.memory.add_summary(summary)
+                    self.memory.reset_token_count()
+                    self.transcript.append({"type": "compact", "summary": summary})
 
             # 累计 token 到终止条件上下文
             if usage:
@@ -372,6 +399,7 @@ class Agent:
                     _saga_stack.append((step_id, tool_name, tool.compensate, dict(tool_input)))
 
                 self.memory.add_tool(result, call["id"])
+                self.transcript.append({"role": "tool", "content": result, "tool_call_id": call["id"]})
                 record.observations.append(result)
 
                 # 插件：tool_after_call（status 三态：success / failed / idempotency_hit）
@@ -410,4 +438,6 @@ class Agent:
     def reset(self) -> None:
         """重置会话记忆与轨迹，开始新任务。"""
         self.memory.clear()
+        self.memory.reset_token_count()
         self.trace.reset()
+        self.transcript = Transcript()

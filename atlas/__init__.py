@@ -1,4 +1,8 @@
 """Atlas - 面向通用任务的 Agent 框架。"""
+from .context.attachment import Attachment, AttachmentRegistry
+from .context.compact import CompactManager
+from .context.trace import StepRecord, Trace
+from .context.transcript import Transcript
 from .core.agent import Agent
 from .core.evaluator import ArtifactSchemaEvaluator, Evaluator
 from .core.multi_agent import (
@@ -7,7 +11,6 @@ from .core.multi_agent import (
     SubagentSpec,
     parallel_gather,
 )
-from .context.trace import StepRecord, Trace
 from .llm.base import LLM
 from .memory.base import Memory
 from .render import PlainRenderer, Renderer
@@ -29,4 +32,8 @@ __all__ = [
     "parallel_gather",
     "Evaluator",
     "ArtifactSchemaEvaluator",
+    "Attachment",
+    "AttachmentRegistry",
+    "CompactManager",
+    "Transcript",
 ]
