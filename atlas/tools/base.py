@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 import jsonschema
 
@@ -26,6 +26,13 @@ class Tool:
     isReadOnly: bool = False  # 纯查询，无副作用
     isIdempotent: bool = False  # 天然幂等（重放安全）
     hasSideEffects: bool = False  # 有副作用，需要补偿管理
+    compensate: Callable[[dict, Any, dict], dict] | None = None
+    """补偿函数（仅当 hasSideEffects=True 且 isIdempotent=False 时必须非 None）。
+    参数 1: compensate_input - 原工具执行时的输入 dict（含 _idempotency_key）
+    参数 2: original_result - 原工具成功时的返回结果字符串（失败时为 None 或错误描述）
+    参数 3: context        - dict，包含 run_id/step_id/tool_name 三个上下文字段
+    返回值: 不做要求，内核只关心是否抛异常。返回非 None 的带 error 键 dict 视为业务失败。
+    """
 
     def validate_input(self, input: dict) -> None:
         """用 JSON Schema 校验输入参数，校验失败抛 jsonschema.ValidationError。"""
@@ -51,23 +58,23 @@ class Toolkit:
         isReadOnly: bool = False,
         isIdempotent: bool = False,
         hasSideEffects: bool = False,
+        compensate: Callable[[dict, Any, dict], dict] | None = None,
     ) -> Tool:
         """注册一个工具，重名时直接报错（消除命名冲突的模糊性）。
 
         三分类标志约束：
         - isReadOnly=True 自动强制 isIdempotent=True（纯查询天然幂等）
-        - hasSideEffects=True 且 isIdempotent=False 打 warning（后续 Saga 需要补偿）
+        - hasSideEffects=True 且 isIdempotent=False 必须注册 compensate()，否则 ValueError 拒绝
         """
         if name in self._tools:
             raise ValueError(f"工具已存在: {name}")
         # 纯查询天然幂等，自动修正
         if isReadOnly and not isIdempotent:
             isIdempotent = True
-        # 有副作用且非幂等，提醒后续需要注册补偿
-        if hasSideEffects and not isIdempotent:
-            _log.warning(
-                "tool.side_effects_non_idempotent",
-                extra={"tool_name": name, "hint": "后续 Saga 补偿需注册 compensate()"},
+        # 有副作用且非幂等，必须注册 compensate()，否则直接拒绝
+        if hasSideEffects and not isIdempotent and compensate is None:
+            raise ValueError(
+                f"Tool {name}: hasSideEffects=True 且非幂等，必须注册 compensate() 函数"
             )
         tool = Tool(
             name=name,
@@ -77,6 +84,7 @@ class Toolkit:
             isReadOnly=isReadOnly,
             isIdempotent=isIdempotent,
             hasSideEffects=hasSideEffects,
+            compensate=compensate,
         )
         self._tools[name] = tool
         return tool

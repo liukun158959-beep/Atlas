@@ -18,7 +18,8 @@ from ..journal.base import JournalEvent, JournalProtocol
 from ..llm.base import LLM
 from ..memory.base import Memory
 from ..render import PlainRenderer, Renderer
-from ..tools.base import Toolkit
+from ..tools.base import Tool, Toolkit
+from ..utils.idempotency import IDEMPOTENCY_USER_KEY, derive as derive_idempotency_key
 from .plugin import PluginManager
 from .terminator import CompositeTerminator, Terminator, make_default_terminator
 
@@ -120,6 +121,10 @@ class Agent:
         run_id = str(uuid.uuid4())
         self.trace.meta["run_id"] = run_id
 
+        # Phase 2.1 Saga：记录已成功执行的非幂等有副作用 step，LIFO 补偿
+        _saga_stack: list[tuple[str, str, Any, dict]] = []  # (step_id, tool_name, compensate_func, compensate_input)
+        _compensate_failed: list[tuple[str, str, str]] = []  # (step_id, tool_name, error_str)
+
         self.memory.add_user(user_input)
         openai_tools = self.tools.to_openai_tools() or None
 
@@ -157,6 +162,46 @@ class Agent:
             should_stop, reasons = self.terminator.should_stop(term_ctx)
             if should_stop:
                 final = f"Agent 终止：{'; '.join(reasons)}"
+                # Phase 2.1 Saga：无最终答案时 LIFO 补偿所有非幂等有副作用工具
+                last_result = None
+                if _saga_stack:
+                    self.plugin_manager.emit(
+                        "compensate_start",
+                        run_id=run_id,
+                        failed_step_id=step_id if 'step_id' in dir() else f"{run_id}:{step_no}:0",
+                        compensate_count=len(_saga_stack),
+                    )
+                    self._journal_append(
+                        run_id, "compensate_start",
+                        {"compensate_count": len(_saga_stack), "failed_reason": "; ".join(reasons)},
+                    )
+                    while _saga_stack:
+                        sid, tname, comp_func, ci = _saga_stack.pop()
+                        try:
+                            comp_func(ci, last_result, {"run_id": run_id, "step_id": sid, "tool_name": tname})
+                            self._journal_append(
+                                run_id, "compensate_finish",
+                                {"step_id": sid, "tool_name": tname, "status": "success"},
+                            )
+                        except Exception as e:
+                            err = str(e)
+                            _compensate_failed.append((sid, tname, err))
+                            self.plugin_manager.emit(
+                                "compensate_failed",
+                                run_id=run_id,
+                                step_id=sid,
+                                tool_name=tname,
+                                error=err,
+                                retry_count=1,
+                                next_retry_at=None,
+                            )
+                            self._journal_append(
+                                run_id, "compensate_failed",
+                                {"step_id": sid, "tool_name": tname, "error": err, "retry_count": 1},
+                            )
+                    if _compensate_failed:
+                        failed_list = ", ".join([f"{t}(sid={s}:{e})" for s, t, e in _compensate_failed])
+                        final += f"\n补偿失败列表: [{failed_list}] 请人工介入"
                 self._emit_and_journal(
                     run_id, "turn_finish",
                     payload={"turn_idx": step_no, "decisions": []},
@@ -168,10 +213,10 @@ class Agent:
                     self.trace.render(self.renderer, depth=0)
                 self._emit_and_journal(
                     run_id, "agent_finish",
-                    payload={"final_result": final, "status": "terminated"},
+                    payload={"final_result": final, "status": "terminated", "compensate_failed": _compensate_failed},
                     final_result=final,
                     status="terminated",
-                    context={"reasons": reasons},
+                    context={"reasons": reasons, "compensate_failed": _compensate_failed},
                 )
                 self.renderer.markdown(final, title="终止信息")
                 return final
@@ -256,10 +301,11 @@ class Agent:
                 return final
 
             # 执行所有工具调用，结果回填给 LLM 作为下一步的观察
+            # Phase 2.1：执行前查幂等 cache 跳过，非幂等有副作用成功后入 saga_stack
             for tool_idx, call in enumerate(tool_calls):
                 fn = call["function"]
                 tool_name = fn["name"]
-                # 解析工具参数
+                # Step 1: 解析工具参数（保留原始解析逻辑）
                 if isinstance(fn["arguments"], str):
                     try:
                         tool_input = json.loads(fn["arguments"])
@@ -268,8 +314,14 @@ class Agent:
                 else:
                     tool_input = fn["arguments"] or {}
                 step_id = f"{run_id}:{step_no}:{tool_idx}"
+                # 取 Tool 对象：三标志 + compensate 从这取
+                tool = self.tools.get(tool_name)
 
-                # 插件：tool_before_call
+                # Step 2: 幂等键：先 pop 用户显式魔法字段（不要传给真正工具执行）
+                explicit_key = tool_input.pop(IDEMPOTENCY_USER_KEY, None)
+                key = explicit_key or derive_idempotency_key(run_id, tool_name, tool_input)
+
+                # 插件：tool_before_call（幂等键去掉魔法字段之后的 input，符合用户预期）
                 self._emit_and_journal(
                     run_id, "tool_before_call",
                     payload={
@@ -277,6 +329,7 @@ class Agent:
                         "step_id": step_id,
                         "tool_name": tool_name,
                         "input": tool_input,
+                        "idempotency_key": key,
                     },
                     turn_idx=step_no,
                     step_id=step_id,
@@ -284,19 +337,44 @@ class Agent:
                     input=tool_input,
                 )
 
-                tool_start = time.time()
+                # Step 3: 查幂等 cache，命中 → 跳过执行，不进 saga_stack
                 tool_status = "success"
-                try:
-                    result = self.tools.execute(tool_name, fn["arguments"])
-                except Exception as e:
-                    result = f"工具执行失败: {e}"
-                    tool_status = "failed"
-                tool_duration_ms = int((time.time() - tool_start) * 1000)
+                tool_duration_ms = 0
+                cached_result = self.journal.cache_get(key) if self.journal else None
+                if cached_result is not None:
+                    result = cached_result
+                    tool_status = "idempotency_hit"
+                else:
+                    # Step 4: 真正执行（原有 try/except 逻辑不变）
+                    tool_start = time.time()
+                    try:
+                        # 注意：execute 内部重新 json.loads(arguments)，所以传原始 fn["arguments"]
+                        # 但我们已经 pop 掉了 _idempotency_key → 重新序列化一份去掉魔法字段的 arguments
+                        cleaned_args = tool_input if not isinstance(fn["arguments"], str) else json.dumps(tool_input, ensure_ascii=False)
+                        result = self.tools.execute(tool_name, cleaned_args)
+                        tool_status = "success"
+                    except Exception as e:
+                        result = f"工具执行失败: {e}"
+                        tool_status = "failed"
+                    tool_duration_ms = int((time.time() - tool_start) * 1000)
+
+                    # 执行成功才写幂等 cache（失败不写，下次能重试）
+                    if self.journal and tool_status == "success":
+                        self.journal.cache_set(key, result)
+
+                # Step 5: 进 saga_stack：非幂等有副作用 且 有 compensate 且 真正执行成功时
+                if (
+                    tool.hasSideEffects
+                    and not tool.isIdempotent
+                    and tool.compensate is not None
+                    and tool_status == "success"
+                ):
+                    _saga_stack.append((step_id, tool_name, tool.compensate, dict(tool_input)))
 
                 self.memory.add_tool(result, call["id"])
                 record.observations.append(result)
 
-                # 插件：tool_after_call
+                # 插件：tool_after_call（status 三态：success / failed / idempotency_hit）
                 self._emit_and_journal(
                     run_id, "tool_after_call",
                     payload={
@@ -307,6 +385,7 @@ class Agent:
                         "result": {"output": result},
                         "duration_ms": tool_duration_ms,
                         "status": tool_status,
+                        "idempotency_key": key,
                     },
                     turn_idx=step_no,
                     step_id=step_id,

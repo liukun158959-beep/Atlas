@@ -1,9 +1,9 @@
-"""Tool ABI 增强演示：三分类标志 + validate_input。
+"""Tool ABI 增强演示：三分类标志 + compensate + validate_input。
 
-纯工具层验证，不涉及 LLM。展示 Phase 1 Tool ABI 增强：
+纯工具层验证，不涉及 LLM。展示 Tool ABI 增强：
 - isReadOnly / isIdempotent / hasSideEffects 三分类标志
 - isReadOnly=True 自动强制 isIdempotent=True
-- hasSideEffects=True 且 isIdempotent=False 时打 warning
+- hasSideEffects=True 且 isIdempotent=False 必须注册 compensate()
 - validate_input 用 JSON Schema 校验输入
 
 用法：
@@ -26,6 +26,12 @@ def _write_file(args: dict) -> str:
     return f"已写入 {args['path']}（{len(args.get('content', ''))} 字符）"
 
 
+def _write_file_compensate(compensate_input, original_result, context) -> dict:
+    """写文件的补偿函数（demo 版，无实际副作用）：删除 compensate_input["path"] 对应文件。"""
+    # 这里只做占位演示，真实环境下应 os.remove(compensate_input["path"])
+    return {}
+
+
 def _set_flag(args: dict) -> str:
     """幂等设置标志位：重复调用结果一致，重放安全。"""
     return f"flag={args['name']} 已设为 {args['value']}（幂等）"
@@ -46,9 +52,10 @@ def main() -> None:
         },
         isReadOnly=True,
     )
-    # 2. 有副作用且非幂等：写文件（注册时会打 warning，提示需注册补偿）
+    # 2. 有副作用且非幂等：写文件（Phase 2.1 必须带 compensate）
     tk.register(
         func=_write_file, name="write_file", description="写文件（有副作用）",
+        compensate=_write_file_compensate,
         parameters={
             "type": "object",
             "properties": {

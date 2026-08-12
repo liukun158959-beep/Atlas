@@ -44,6 +44,14 @@ class JournalProtocol(Protocol):
         """列出所有 run_id。"""
         ...
 
+    def cache_get(self, key: str) -> str | None:
+        """按幂等键取缓存值，无则返回 None。"""
+        ...
+
+    def cache_set(self, key: str, value: str) -> None:
+        """按幂等键写缓存值（覆盖写）。"""
+        ...
+
 
 def _now_iso() -> str:
     """返回当前 UTC 时间的 ISO 8601 字符串。"""
@@ -93,6 +101,13 @@ class InMemoryJournal:
     save_full_payload: bool = False
     _events: list[JournalEvent] = field(default_factory=list)
     _counters: dict[str, int] = field(default_factory=dict)
+    _cache: dict[str, str] = field(default_factory=dict)
+
+    def cache_get(self, key: str) -> str | None:
+        return self._cache.get(key)
+
+    def cache_set(self, key: str, value: str) -> None:
+        self._cache[key] = value
 
     def append(self, event: JournalEvent) -> None:
         """追加事件。若 save_full_payload=False，自动摘要 payload。"""

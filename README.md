@@ -182,23 +182,29 @@ Message
 | 天然幂等 | `isIdempotent=True` | PUT（带版本号）/ DELETE（带 ID） | 走 Journal + 幂等键防重复，不记补偿 |
 | 有副作用且非幂等 | `hasSideEffects=True` + `isIdempotent=False` | 扣款 / 发邮件 / 第三方提交 | **必须实现 `compensate()`**，走完整 Saga |
 
-**Tool 接口（规划中）**：
+**Tool 接口（已实现，dataclass ABI）**：
 
 ```python
+from dataclasses import dataclass
+from typing import Any, Callable
+
+@dataclass
 class Tool:
     name: str
     description: str
-    inputSchema: dict
-    isReadOnly: bool = False           # 纯查询，无副作用
+    parameters: dict                   # OpenAI function.parameters JSON Schema
+    func: Callable[[dict], str]        # 主函数：输入 dict → 输出字符串
+    parameters_factory: Callable[[], dict] | None = None  # 懒加载，解决循环依赖
+    isReadOnly: bool = False           # 纯查询，无副作用（自动强制幂等）
     isIdempotent: bool = False         # 天然幂等（重放安全）
     hasSideEffects: bool = False       # 有副作用，需要补偿管理
-    isConcurrencySafe: bool = False    # 是否可并行执行
+    compensate: Callable[[dict, Any, dict], dict] | None = None
+    # compensate 签名：compensate(compensate_input, original_result, context) → dict
+    #   hasSideEffects=True + isIdempotent=False 必须非 None，否则 Toolkit.register() 抛 ValueError 拒绝
 
-    def call(self, input, context) -> dict: ...
-
-    def compensate(self, compensate_input, original_result, context) -> dict:
-        """补偿动作。仅 hasSideEffects=True 且非 isIdempotent 时必须实现。"""
-        raise NotImplementedError
+    def validate_input(self, input: dict) -> None:
+        """按 parameters JSON Schema 校验输入，失败抛 jsonschema.ValidationError。"""
+        ...
 ```
 
 ## Saga 补偿机制
@@ -224,14 +230,16 @@ class Tool:
 | 幂等键 | 副作用工具调用自动去重，重放返回首次结果 | 邮件发两次、订单提交两次 |
 | Saga 补偿 | 不可逆操作必须注册反向动作，失败时按 LIFO 顺序补偿 | 无法撤销已执行的不可逆操作 |
 
-**补偿失败的三级处理**（绝不静默忽略）：
+**补偿失败处理（不做自动重试，消除 fallback 触发场景）**：
 
 ```
-Level 1: 自动重试（指数退避，最多 5 次）
-   ↓ 仍失败
-Level 2: 持久化到 Journal + 触发告警（人工介入）
+compensate() 抛异常
    ↓
-Level 3: 人工处理后标记 resolved，停止重试
+记录到 _compensate_failed 列表 + emit compensate_failed 插件钩子 + Journal compensate_failed 事件
+   ↓
+continue 下一个补偿（单个补偿失败不影响其他 LIFO 项）
+   ↓
+Agent 最终返回值尾部追加"补偿失败列表: [...] 请人工介入" → 交给用户人工处理
 ```
 
 ### 日志规范（排查补偿失败）
@@ -337,9 +345,13 @@ log.warning("saga.compensate.complete",
 - 单 Agent ReAct 循环 + 多 Agent 协作（`MultiAgentOrchestrator` Planner-Worker-Critic 模式，渲染统一走 Renderer）
 - **并行子 Agent 内核原语（Phase 2-1）**：`spawn_subagents` 工具自动注入 + `parallel_gather` ThreadPoolExecutor 并行 + 子 Agent 独立上下文 + artifact schema 校验 + Trace 父子嵌套递归渲染，实测加速比 ≈ 2.3x
 - **声明式 Role + 任务 YAML 配置**：Role 三元组（system_prompt + tools + llm_config）与父 Agent/task 统一在 YAML 中声明，改 YAML 即改行为
-- 插件体系：PluginProtocol 10 个生命周期钩子 + PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
+- 插件体系：PluginProtocol 10 个生命周期钩子（含 `compensate_start/compensate_finish/compensate_failed` 新增 3 个）+ PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
 - 5 个 LLM provider 预设（Qwen / OpenAI / Deepseek / Moonshot / 智谱）
 - `atlas init` 一键引导（venv + 依赖安装 + .env 配置）
+- **Tool ABI 增强（Phase 2.1 收尾）**：compensate 字段正式入 Tool dataclass ABI；注册约束升级为 ValueError 直接拒绝（hasSideEffects=True + 非幂等 无 compensate → 抛错不兜底）；tool_status 三态：success / failed / idempotency_hit
+- **幂等键 + Saga 补偿注册（Phase 2.1 收尾）**：`atlas.utils.derive_idempotency_key(run_id, tool_name, input_dict)` 派生 40 位 SHA-1；工具输入支持 `_idempotency_key` 魔法字段显式覆盖；Journal 扩展 `cache_get/cache_set` 持久化幂等结果；Agent 无最终答案时 LIFO 反向补偿已成功入栈的非幂等副作用工具；幂等命中不进 saga_stack
+- **独立 Evaluator（校验门，Phase 2.1 收尾）**：内核外 Protocol + 内置 `ArtifactSchemaEvaluator` JSON Schema 契约校验；用户在 `agent.run(task)` 之后独立调用 `evaluator.evaluate(result, events)`，不从内核中自评；顶层 `from atlas import Evaluator, ArtifactSchemaEvaluator` 直接用
+- **SideEffectTracker demo 辅助**：`atlas.utils.SideEffectTracker` record/erase/exists/is_empty；配合 `examples/saga_demo.py` 断言 Saga 补偿后所有副作用记录 100% 清零（无残留）
 
 ## 技术栈
 
@@ -454,6 +466,22 @@ python examples/terminator_demo.py --mock --plain
 
 # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
 python examples/plugin_cost_demo.py --mock --plain
+
+# Phase 2.1 收尾：幂等键命中跳过 + Saga LIFO 补偿（write_po + charge 成功 → ship FAIL-SHIP-500 → 终止 → 补偿清零）
+# 100% 可复现；末尾自带 SideEffectTracker.is_empty() 断言
+python examples/saga_demo.py --mock --plain
+```
+
+独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
+
+```python
+from atlas import ArtifactSchemaEvaluator, Agent
+
+# ... agent 正常跑完得到 result 和 run_id
+ok, reasons = ArtifactSchemaEvaluator(contracts=[
+    ("content", {"type": "string", "minLength": 1}),
+]).evaluate(result, agent.journal.get_events(run_id))
+assert ok, reasons
 ```
 
 ## 项目结构
@@ -462,14 +490,17 @@ python examples/plugin_cost_demo.py --mock --plain
 Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核
-│   │   ├── agent.py        # ReAct 循环 + role_configs/tool_specs_pool/spawn_subagents/terminator/plugin_manager/journal 注入
+│   │   ├── agent.py        # ReAct 循环 + role_configs/tool_specs_pool/spawn_subagents/terminator/plugin_manager/journal 注入 + 幂等键 cache 命中跳过 + SagaStack LIFO 补偿 + compensate_* 三插件钩子
+│   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol + ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用）
 │   │   ├── terminator.py   # 终止条件组合器：MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector，| 运算符组合
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather + make_spawn_subagents_tool
 │   │   ├── orchestrator.py # Planner-Worker-Critic 多 Agent 协作编排器（Renderer 统一渲染）
 │   │   └── plugin.py       # PluginProtocol + PluginManager + BasePlugin（钩子 no-op 基类）
 │   ├── journal/            # 执行日志 event sourcing
-│   │   └── base.py         # JournalProtocol + JournalEvent + InMemoryJournal（摘要模式默认，opt-in 全量）
-│   ├── utils/              # 工具函数
+│   │   └── base.py         # JournalProtocol 扩 cache_get/cache_set + JournalEvent + InMemoryJournal（摘要模式默认，opt-in 全量 + _cache 幂等存储）
+│   ├── utils/              # 工具函数（Phase 2.1 扩展：幂等键 + 副作用追踪器）
+│   │   ├── idempotency.py  # Phase 2.1 新增：derive_idempotency_key(run_id, tool_name, input) → SHA-1 40 位 + IDEMPOTENCY_USER_KEY='_idempotency_key' 常量
+│   │   ├── tracker.py      # Phase 2.1 新增：SideEffectTracker record/erase/is_empty 可观测 Saga 补偿覆盖度
 │   │   └── yaml_loader.py  # load_parallel_subagent_config()：YAML → RoleConfig + parent + task
 │   ├── render/             # 渲染层：Protocol + PlainRenderer + RichRenderer
 │   │   ├── base.py         # Renderer Protocol（5 个方法）
@@ -481,7 +512,7 @@ Atlas/
 │   ├── llm/                # LLM 接入层：OpenAI 兼容协议
 │   │   └── base.py         # chat() 返回 {message, usage, duration_ms} 三层结构
 │   ├── tools/              # 工具基座与内置工具
-│   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + validate_input + parameters_factory）/ Toolkit
+│   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + compensate 字段 + validate_input + parameters_factory）/ Toolkit.register() 升级补偿约束为 ValueError 拒绝
 │   │   └── builtin.py      # calculator / get_current_time（均标记 isReadOnly=True）
 │   ├── memory/             # 会话记忆
 │   │   └── base.py
@@ -493,10 +524,11 @@ Atlas/
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
 │   ├── quickstart.py       # 快速开始示例（支持 RichRenderer / --plain）
+│   ├── saga_demo.py        # Phase 2.1 新增：Saga 补偿完整流程（write_po + charge 成功 → ship FAIL-SHIP-500 → MaxSteps(3) 终止 → LIFO 补偿清零；SideEffectTracker 断言）
 │   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（YAML 声明式配置，< 120 行，--config 可指定）
 │   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置（被 yaml_loader 读取）
 │   ├── multi_agent_demo.py # Planner-Worker-Critic 示例（Renderer 统一渲染）
-│   ├── tool_abi_demo.py    # Tool ABI 增强：三分类标志 + validate_input 通过/失败演示
+│   ├── tool_abi_demo.py    # Tool ABI 增强：三分类标志 + validate_input 通过/失败演示 + compensate 注册
 │   ├── journal_replay_demo.py  # Journal event sourcing：12 事件全生命周期 + replay 聚合
 │   ├── terminator_demo.py  # 终止条件组合器：MaxSteps/Timeout/RepetitionDetector 三种触发
 │   └── plugin_cost_demo.py # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
@@ -539,15 +571,15 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 
 #### 2.1 内核原语（控制平面，必做）
 
-- [x] **Tool ABI 增强（分类标志 + validateInput）**—— 三标志（`isReadOnly`/`isIdempotent`/`hasSideEffects`，默认全 False）；注册时 `isReadOnly=True` 自动强制幂等，`hasSideEffects+非幂等` 打 warning；`Tool.validate_input()` 走 `jsonschema`；`isConcurrencySafe`/`compensate()` 留后续 Saga 阶段
-- [x] **Hook 机制（插件 10 生命周期）**—— `on_agent_start/finish`、`on_turn_start/finish`、`on_llm_before/after_call`、`on_tool_before/after_call`、`on_compensate_start/failed`；`BasePlugin` no-op 基类，子类按需覆写；配合 `run_id`（UUID）+ `step_id` 全链路可追溯
+- [x] **Tool ABI 增强（分类标志 + validateInput + compensate 字段）**—— 三标志（`isReadOnly`/`isIdempotent`/`hasSideEffects`，默认全 False）；注册时 `isReadOnly=True` 自动强制幂等，`hasSideEffects+非幂等` **ValueError 直接拒绝注册（无 compensate 不兜底）**；`Tool.validate_input()` 走 `jsonschema`；`parameters_factory` 懒加载闭环；`tool_status` 三态（success / failed / idempotency_hit）
+- [x] **Hook 机制（插件 13 生命周期，原 10 新增 compensate 三钩子）**—— `on_agent_start/finish`、`on_turn_start/finish`、`on_llm_before/after_call`、`on_tool_before/after_call`、`on_compensate_start/finish/failed`；`BasePlugin` no-op 基类，子类按需覆写；配合 `run_id`（UUID）+ `step_id` 全链路可追溯
 - [x] **Role 抽象**（`RoleConfig`：system_prompt + tool_names + temperature/max_steps/timeout_ms 三元组，Python 编程式注入，YAML 声明式由上层 `parallel_subagent_config.yaml` 承载）—— 角色定义不硬编码在内核，由上层注入
 - [x] **`spawn_subagents` 内置工具**（`make_spawn_subagents_tool` 闭包工厂 + `_inject_spawn_tool` 自动注入 + role enum 懒加载 + 嵌套守卫双保险；context 隔离：子 Agent 独立 Memory/Trace；artifact schema 校验：`jsonschema.validate` 不改写原文仅打标记）
 - [x] **`parallel_gather` 原语**（ThreadPoolExecutor 并行 fan-out/gather + enumerate O(1) 顺序保持 + partial success 错误隔离 + 并行效率 meta）—— 持久化/幂等防重留给 Journal 原语
 - [x] **预算护栏（terminator 侧可触发）**—— `CostCap(max_usd)` + `TokenBudget(max_tokens)` 终止条件；`TokenCostPlugin` 累计 `cost_usd` 写入 `_term_ctx`；三态熔断器留后续 Phase 2.2
-- [ ] 幂等键 + Saga 补偿注册
-- [ ] 独立 Evaluator（校验门，不让 Agent 自评）
-- [ ] **Saga 补偿演示模式**：`examples/saga_demo.py` 一键跑通失败→补偿→成功的完整流程（对应 EP-4）
+- [x] **幂等键 + Saga 补偿注册**—— `atlas.utils.idempotency.derive(run_id, tool_name, input_dict)` SHA-1 40 位派生或 `_idempotency_key` 显式覆盖；Journal 扩 `cache_get/cache_set` 命中跳过真实 func；Agent 无最终答案时 LIFO 反向 compensate 非幂等副作用工具；失败不重试，记录 compensate_failed 插件钩子 + 尾附文字提示人工介入
+- [x] **独立 Evaluator（校验门，不让 Agent 自评）**—— `Evaluator Protocol`（@runtime_checkable）+ 内置 `ArtifactSchemaEvaluator`（JSON Schema 契约 list[(key, schema)]）；顶层 `from atlas import Evaluator, ArtifactSchemaEvaluator`；用户在 agent.run() 之后外部调用
+- [x] **Saga 补偿演示模式**：`examples/saga_demo.py` 一键跑通 write_po→charge→ship(FAIL)→终止→LIFO 补偿→SideEffectTracker.is_empty() 断言（对应 EP-4，100% 可复现，支持 --mock --plain）
 - [ ] **Dashboard 增强**：展示补偿日志、重试状态、告警列表（对应 EP-3）
 
 #### 2.2 多 Agent 模式包（上层可选，非内核）

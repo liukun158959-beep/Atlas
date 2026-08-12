@@ -1,5 +1,6 @@
 """Atlas - 面向通用任务的 Agent 框架。"""
 from .core.agent import Agent
+from .core.evaluator import ArtifactSchemaEvaluator, Evaluator
 from .core.multi_agent import (
     RoleConfig,
     SubagentResult,
@@ -26,4 +27,6 @@ __all__ = [
     "SubagentSpec",
     "SubagentResult",
     "parallel_gather",
+    "Evaluator",
+    "ArtifactSchemaEvaluator",
 ]
