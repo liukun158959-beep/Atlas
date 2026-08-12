@@ -11,6 +11,7 @@ from .core.multi_agent import (
     SubagentSpec,
     parallel_gather,
 )
+from .core.scope import Scope
 from .llm.base import LLM
 from .memory.base import Memory
 from .render import PlainRenderer, Renderer
@@ -36,4 +37,5 @@ __all__ = [
     "AttachmentRegistry",
     "CompactManager",
     "Transcript",
+    "Scope",
 ]

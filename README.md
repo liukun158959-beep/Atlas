@@ -362,6 +362,10 @@ log.warning("saga.compensate.complete",
 - **Compact 机制（Phase 1 第一批）**：`CompactManager(threshold=8000, llm=agent.llm)`（复用主 LLM，不额外配置）；`should_compact(token_count)` 阈值判断；`compact()` 生成 9 段 Summary；Agent `compact_threshold` 参数默认 8000（None 禁用）；顶层 `from atlas import CompactManager`
 - **Transcript 磁盘层（Phase 1 第一批）**：`atlas.context.Transcript` append-only 事件存档；Agent 默认创建，`agent.transcript` 直接访问；Memory 写入点（user/assistant/tool/compact）全部双写 transcript.append；`replay()` 全量返回；`to_jsonl(path)/from_jsonl(path)` JSONL 导出恢复；顶层 `from atlas import Transcript`
 - **compact_demo.py（Phase 1 第一批 demo）**：`--mock` 模式下 CompactFakeLLM 逐轮递增 token（3000→5000→7000→8500→3000），第 4 轮必触发 compact；5 项断言（summary/boundary 存在/project 13→4 条/无 isMeta/Transcript 5+5+1 事件）；真实 LLM 模式 soft 检查（不强制断言，提示加 --mock）
+- **Scope（Phase 1 第二批）**：`atlas.core.Scope` 进程内 per-key 隔离；`_locks[key]` + `_states[key]` 懒创建（双 guard 锁防并发重复造）；`with scope.acquire(key)` context manager 阻塞拿锁 → 返 SimpleNamespace（.key + .state dict）→ `__exit__` 写回 state 并释放锁（异常也释放 + 写回当前状态，不兜底回滚）；key 非空 str 否则 ValueError；`get_state(key)` 返回只读拷贝
+- **极简 Dashboard 骨架（Phase 1 第二批）**：`python -m atlas dashboard --port 8765` 一键启动；HTTP(8765) ThreadingHTTPServer 子线程 + WebSocket(8766) asyncio 当前线程；HTML 三面板字符串内嵌（免读文件路径问题）；左 Run 列表（run_id/status/event_count/step_count/start→end）+ 中 Trace DAG（StepRecord 卡片 + 子 Trace 缩进 + tool_names 绿标）+ 右 Events（最近 200 条，类型着色）；WebSocket 每 500ms 广播 DATASTATE snapshot；`atlas.cli.dashboard.publish(run_id, journal, trace)` 全局 API 主动推送（threading.Lock 保护，journal 全 run 聚合 + trace 递归打平 nodes/edges）
+- **scope_demo.py（Phase 1 第二批 demo）**：3 项断言（同 key 串行 start>=end / 不同 key 并行总耗时<0.18s / state 写回 first_write=42 跨 acquire 可读）
+- **dashboard_demo.py（Phase 1 第二批 demo）**：后台线程起 dashboard → 3 轮 QuickstartMockLLM calculator mock 跑不同 run_id → 每轮前后 publish() 推送 → 提示用户浏览器打开 http://localhost:8765 → 驻留 10 秒自动退出
 
 ## 技术栈
 
@@ -484,6 +488,16 @@ python examples/saga_demo.py --mock --plain
 # Phase 1 第一批：Compact 机制（9 段 Summary + Boundary + Transcript + project 投影）
 # --mock 必触发 compact（第 4 轮 token=8500 > 8000），5 项断言全通过
 python examples/compact_demo.py --mock --plain
+
+# Phase 1 第二批：Scope（per-key 隔离）
+# 3 项断言：同 key 串行 + 不同 key 并行 < 0.18s + state 写回跨 acquire 可见
+python examples/scope_demo.py
+
+# Phase 1 第二批：Dashboard（HTTP 三面板 + WebSocket 推送）
+# 后台起 dashboard + 3 轮 mock quickstart → 浏览器打开 http://localhost:8765 看实时 DAG
+python examples/dashboard_demo.py
+# 或单独长期驻留（浏览器刷新即连接，用户代码手动 publish 推送数据）
+python -m atlas dashboard --port 8765
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -528,6 +542,13 @@ Atlas/
 │   ├── tools/              # 工具基座与内置工具
 │   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + compensate 字段 + validate_input + parameters_factory）/ Toolkit.register() 升级补偿约束为 ValueError 拒绝
 │   │   └── builtin.py      # calculator / get_current_time（均标记 isReadOnly=True）
+│   ├── core/               # Agent 内核 + 9 原语
+│   │   ├── agent.py        # Agent.run() ReAct 循环：tool_call 执行 → Terminator → Plugin 10 钩子 → Journal 事件 + step 计数；compact_threshold + compact_manager + transcript 接入
+│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（10 钩子 no-op 基类）
+│   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()
+│   │   ├── evaluator.py    # Evaluator Protocol + ArtifactSchemaEvaluator（内核外 JSON Schema 契约校验）
+│   │   ├── multi_agent.py  # SubagentSpec/RoleConfig/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）
+│   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire() context manager）
 │   ├── memory/             # 会话记忆
 │   │   └── base.py         # Phase 1 改造：messages 改 @property + _runtime_messages + project() 五步投影 + token 跟踪 + add_attachment()/add_summary()
 │   ├── context/            # 执行轨迹与上下文（Phase 1 扩 4 文件）
@@ -536,7 +557,8 @@ Atlas/
 │   │   ├── compact.py      # Phase 1 新增：CompactManager（9 段 Summary + should_compact 阈值判断 + LLM/规则双模式）
 │   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套 + Trace.meta
 │   ├── cli/                # CLI 子命令
-│   │   └── init.py         # atlas init：venv + 依赖安装 + .env 配置
+│   │   ├── init.py         # atlas init：venv + 依赖安装 + .env 配置
+│   │   └── dashboard.py    # Phase 1 第二批：HTTP(8765)+WebSocket(8766) 三面板 Dashboard + publish() 推送 API + HTML 字符串内嵌
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -549,7 +571,9 @@ Atlas/
 │   ├── journal_replay_demo.py  # Journal event sourcing：12 事件全生命周期 + replay 聚合
 │   ├── terminator_demo.py  # 终止条件组合器：MaxSteps/Timeout/RepetitionDetector 三种触发
 │   ├── plugin_cost_demo.py # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
-│   └── compact_demo.py     # Phase 1 新增：Compact 机制演示（--mock 第 4 轮 token=8500 触发，5 项断言）
+│   ├── compact_demo.py     # Phase 1 新增：Compact 机制演示（--mock 第 4 轮 token=8500 触发，5 项断言）
+│   ├── scope_demo.py       # Phase 1 第二批：Scope 演示（同 key 串行 + 不同 key 并行 + state 写回 3 断言）
+│   └── dashboard_demo.py   # Phase 1 第二批：Dashboard 演示（后台起 server + 3 轮 mock quickstart publish）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -577,11 +601,11 @@ Atlas/
 - [x] **历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）**—— 五步流水线：找最后 compact_boundary → 保留 system prompt + Summary + Boundary 后消息 → isMeta 分层转换（Attachment→system / Summary→assistant / Boundary→跳过）→ tool_call 配对修复（删除断裂 tool_calls 和无配对 tool 消息）→ 超阈值裁剪最旧 user/assistant 对到 target=threshold×0.7
 - [x] **Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器**—— Attachment ABC + AttachmentRegistry（register/create 模式）；重名 ValueError 拒绝 + TypeError 子类校验；to_system_reminder() 子类覆写 + to_message() Runtime 消息生成；Memory.add_attachment() 便捷写入
 - [x] **Journal（执行日志，event sourcing 恢复）**—— `InMemoryJournal` + `JournalProtocol`（SQLite 实现预留）；事件结构折中（壳 dataclass + 自由 payload dict）；摘要模式默认 mask 敏感字段 + 截断 200 字，`save_full_payload=True` opt-in 全量
-- [ ] Scope（按 key 隔离 Agent 实例）—— 参考 Restate Virtual Object 纯 Python 复刻（per-key threading.Lock + 内存状态；context manager acquire(key)；未来 SQLite 持久化后端可插拔）
+- [x] **Scope（按 key 隔离 Agent 实例）**—— `atlas.core.Scope` + `with scope.acquire(key) as ctx` context manager；per-key `_locks[key]` 懒创建（双 guard 锁防并发重复）+ `_states[key]` 内存 state 字典；SimpleNamespace (.key/.state) 模式；异常也释放锁并写回当前 state（不兜底回滚）；`get_state(key)` 返回只读拷贝；key 空/非 str → ValueError
+- [x] **极简 Dashboard 骨架**—— `python -m atlas dashboard --port 8765`；HTTP ThreadingHTTPServer（8765，返回内嵌字符串 HTML 免路径问题）+ WebSocket asyncio（8766，每 500ms 广播 DATASTATE snapshot）；三面板（左 Run 列表 / 中 Trace DAG 卡片缩进 / 右 Events 类型着色）；`atlas.cli.dashboard.publish(run_id, journal, trace)` 全局推送（journal 聚合 run 状态 + trace 递归打平 nodes/edges）；前端自动重连 3s
 - [x] **终止条件组合器**（MaxSteps / Timeout / TokenBudget / CostCap / RepetitionDetector）—— `|` 运算符组合，`CompositeTerminator` 任一命中即终止；默认 `MaxSteps(10) | Timeout(60_000)` 与旧版完全兼容
 - [x] **插件体系（接入 Agent 全生命周期）**：`PluginProtocol` + `PluginManager` + `BasePlugin` 钩子基类（子类按需覆写 no-op）；10 个生命周期 + UUID run_id + 全链路 step_id；预置 `TokenCostPlugin` / `FileLoggerPlugin` 真实工作
 - [x] **声明式 YAML Loader**：`atlas.utils.yaml_loader.load_parallel_subagent_config()` 严格模式（缺字段抛 RuntimeError，不兜底）；`parallel_subagent_demo.py` 默认读 YAML，支持 `--config`
-- [ ] **极简 Dashboard 骨架**：`python -m atlas dashboard` 一键启动，纯 HTML+WebSocket，展示 run 列表 + 单 run DAG 流程图 + 工具调用详情（对应 EP-3）
 
 ### Phase 2：多 Agent 稳定性
 
