@@ -1,207 +1,359 @@
-"""多 Agent 协作：Planner-Worker-Critic 架构。
+"""并行子 Agent 内核原语。
 
-角色分工：
-    Planner - 拆解任务为子任务列表，最后汇总
-    Worker  - 逐个执行子任务，可调用工具
-    Critic  - 审查 Worker 的结果，决定通过或打回
-
-协作流程：
-    任务 → Planner 拆解 → Worker 逐个执行 → Critic 审查
-        ├─ 通过 → 进入下一子任务
-        └─ 打回 → Worker 重做（最多 max_revisions 次）
-    全部子任务完成 → Planner 汇总 → 最终答案
+本模块实现：
+- RoleConfig / SubagentSpec / SubagentResult：声明式数据类
+- _run_subagent：单子 Agent 执行（含独立上下文、超时、Schema 校验）
+- parallel_gather：ThreadPoolExecutor 并行多子 Agent（partial success + 顺序保持）
+- make_spawn_subagents_tool：闭包工厂，生成供父 Agent Toolkit 注入的 spawn_subagents 工具
+    （含 Q17 嵌套守卫、Q19 schema 懒加载 factory）
 """
 from __future__ import annotations
 
+import json
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable
 
-from ..context.trace import Trace
-from ..llm.base import LLM
-from ..tools.base import Toolkit
+if TYPE_CHECKING:  # 避免循环导入
+    from .agent import Agent
 
 
-@dataclass
-class SubTask:
-    """单个子任务。"""
-
-    description: str
-    status: str = "pending"  # pending / running / done / failed
-    result: str = ""
-    revisions: int = 0  # 已被 Critic 打回重做的次数
+# ---------------------------------------------------------------------------
+# 数据类：RoleConfig / SubagentSpec / SubagentResult
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class MultiAgentTrace:
-    """多 Agent 协作的执行轨迹。"""
+class RoleConfig:
+    """子 Agent 角色声明式配置。"""
 
-    plan: list[SubTask] = field(default_factory=list)
-    worker_runs: list[dict] = field(default_factory=list)  # 每次 Worker 执行的记录
-    critic_reviews: list[dict] = field(default_factory=list)  # 每次 Critic 审查的记录
-    final_summary: str = ""
-
-    def __str__(self) -> str:
-        lines = ["=== Multi-Agent Trace ==="]
-        lines.append(f"\n[Plan] 共 {len(self.plan)} 个子任务:")
-        for i, t in enumerate(self.plan, 1):
-            lines.append(f"  {i}. [{t.status}] {t.description}")
-            if t.result:
-                lines.append(f"     → {t.result[:100]}{'...' if len(t.result) > 100 else ''}")
-
-        if self.worker_runs:
-            lines.append(f"\n[Worker] 共执行 {len(self.worker_runs)} 次:")
-            for run in self.worker_runs:
-                lines.append(f"  - 子任务: {run['task'][:60]}")
-                lines.append(f"    结果: {run['result'][:80]}{'...' if len(run['result']) > 80 else ''}")
-
-        if self.critic_reviews:
-            lines.append(f"\n[Critic] 共审查 {len(self.critic_reviews)} 次:")
-            for review in self.critic_reviews:
-                verdict = "通过" if review["approved"] else "打回"
-                lines.append(f"  - [{verdict}] {review['comment'][:80]}")
-
-        if self.final_summary:
-            lines.append(f"\n[Final] {self.final_summary[:200]}")
-        return "\n".join(lines)
+    name: str
+    system_prompt: str
+    tool_names: list[str]
+    temperature: float = 0.3
+    max_steps: int = 5
+    timeout_ms: int = 60_000
 
 
-class MultiAgentOrchestrator:
-    """多 Agent 协作编排器。"""
+@dataclass
+class SubagentSpec:
+    """单个子 Agent 任务规格（由 spawn_subagents 工具参数解析而来）。"""
 
-    def __init__(
-        self,
-        llm: LLM,
-        tools: Toolkit,
-        max_revisions: int = 2,
-    ) -> None:
-        self.llm = llm
-        self.tools = tools
-        self.max_revisions = max_revisions
-        self.trace = MultiAgentTrace()
+    subagent_id: str
+    role: str
+    task: str
+    extra_system_prompt: str | None = None
+    artifact_schema: dict | None = None
 
-    def _planner_decompose(self, task: str) -> list[str]:
-        """Planner 把任务拆成子任务列表。"""
-        prompt = (
-            "你是任务规划师。把用户任务拆解为 2-4 个明确的子任务，"
-            "每个子任务应该是可独立执行的具体步骤。\n\n"
-            f"用户任务: {task}\n\n"
-            "输出格式：每行一个子任务，不要编号，不要额外说明。"
+
+@dataclass
+class SubagentResult:
+    """子 Agent 执行结果（parallel_gather 保持原序返回）。"""
+
+    subagent_id: str
+    role: str
+    task: str
+    artifact: str
+    duration_ms: int
+    error: str | None = None
+    schema_passed: bool | None = None
+    schema_error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# _run_subagent：单子 Agent 执行（Step 2 完整实现）
+# ---------------------------------------------------------------------------
+
+
+def _run_subagent(spec: SubagentSpec, agent_ref: "Agent") -> SubagentResult:
+    """单子 Agent 执行：构造独立 ReAct 实例 + wall-clock 超时 + artifact_schema 校验。
+
+    设计约束（🔴可行性审查修正）：
+    - 子 Agent 的 Toolkit 按 role_cfg.tool_names 从 agent_ref.tool_specs_pool 按名过滤构建，
+      内核绝不 hardcode BUILTIN_TOOLS（遵守 EP-2 解耦）。
+    - 子 Agent 构造时显式 auto_inject_spawn_tool=False（双保险，+ _inject_spawn_tool 的
+      _parent_trace 快速返回） → Q17 嵌套守卫两道防线。
+    - wall-clock 超时：ThreadPoolExecutor(1).result(timeout)；子线程泄漏为已知限制（P-1）。
+    - Schema 校验：不通过只标记 schema_passed=False + schema_error，artifact 原文保留（Q8）。
+    """
+    # 延迟导入：避免模块级循环引用
+    from .agent import Agent
+    from ..tools.base import Toolkit
+
+    t0 = time.perf_counter()
+    role_cfg = agent_ref.role_configs[spec.role]
+
+    # ------------------------------------------------------------------
+    # 2. 按 RoleConfig.tool_names 从 tool_specs_pool 按名过滤，构建子 Toolkit
+    # ------------------------------------------------------------------
+    if role_cfg.tool_names and not agent_ref.tool_specs_pool:
+        raise ValueError(
+            f"角色 {role_cfg.name} 需要工具 {role_cfg.tool_names}，"
+            "但 Agent.tool_specs_pool 为空。构造父 Agent 时请传入 "
+            "tool_specs_pool=BUILTIN_TOOLS（或其他全局工具规格列表）。"
         )
-        messages = [{"role": "user", "content": prompt}]
-        resp = self.llm.chat(messages)
-        content = resp.get("content") or ""
-        # 按行切分，去掉空行
-        subtasks = [line.strip() for line in content.split("\n") if line.strip()]
-        return subtasks
+    sub_toolkit = Toolkit()
+    name_to_spec = {s["name"]: s for s in agent_ref.tool_specs_pool}
+    for tool_name in role_cfg.tool_names:
+        if tool_name not in name_to_spec:
+            raise ValueError(
+                f"角色 {role_cfg.name} 要求的工具 {tool_name} 不在工具规格池中，"
+                "请检查 tool_specs_pool 是否包含该工具。"
+            )
+        sub_toolkit.register(**name_to_spec[tool_name])
 
-    def _worker_execute(self, subtask: str, context: str = "") -> str:
-        """Worker 执行单个子任务，可调用工具。"""
-        prompt = (
-            "你是任务执行者。完成下面这个子任务，"
-            "如果需要计算或获取时间请调用工具。\n\n"
-            f"子任务: {subtask}\n"
-        )
-        if context:
-            prompt += f"\n前面子任务的中间结果:\n{context}\n"
-        prompt += "\n请直接给出执行结果，不要多余解释。"
+    # ------------------------------------------------------------------
+    # 3. 子 Agent 实例化（独立 memory + trace + renderer 同类型新实例）
+    # ------------------------------------------------------------------
+    sub_agent = Agent(
+        llm=agent_ref.llm,
+        tools=sub_toolkit,
+        system_prompt=role_cfg.system_prompt + (spec.extra_system_prompt or ""),
+        max_steps=role_cfg.max_steps,
+        renderer=type(agent_ref.renderer)(),   # Q20：同类型新实例（Rich→Rich，Plain→Plain）
+        role_configs=agent_ref.role_configs,  # 传是传了，但 _inject_spawn_tool 会快速返回
+        parent_trace=agent_ref.trace,          # → 嵌套守卫第一道：子 Agent 标记为有父
+        auto_inject_spawn_tool=False,          # → 嵌套守卫第二道：双保险
+        tool_specs_pool=agent_ref.tool_specs_pool,
+    )
 
-        messages = [{"role": "user", "content": prompt}]
-        openai_tools = self.tools.to_openai_tools() or None
+    # ------------------------------------------------------------------
+    # 4. wall-clock 超时（Q18）：ThreadPoolExecutor + future.result(timeout)
+    # ------------------------------------------------------------------
+    artifact: str = ""
+    error: str | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future: Future = pool.submit(sub_agent.run, spec.task)
+            artifact = future.result(timeout=role_cfg.timeout_ms / 1000)
+    except TimeoutError:
+        error = f"子 Agent 超时（{role_cfg.timeout_ms}ms），已返回部分结果"
+        artifact = artifact or ""
+    except Exception as e:
+        error = f"子 Agent 异常: {type(e).__name__}: {e}"
 
-        # 简化的 ReAct 循环：最多 3 步工具调用
-        for _ in range(3):
-            resp = self.llm.chat(messages, tools=openai_tools)
-            messages.append(resp)
-            tool_calls = resp.get("tool_calls") or []
-            if not tool_calls:
-                return resp.get("content") or ""
-            for call in tool_calls:
-                fn = call["function"]
-                try:
-                    result = self.tools.execute(fn["name"], fn["arguments"])
-                except Exception as e:
-                    result = f"工具执行失败: {e}"
-                messages.append({"role": "tool", "content": result, "tool_call_id": call["id"]})
-        return resp.get("content") or "执行超时"
+    # ------------------------------------------------------------------
+    # 5. artifact_schema 校验（Q4 + Q8）：不改 artifact，仅打标记
+    # ------------------------------------------------------------------
+    schema_passed: bool | None = None
+    schema_error: str | None = None
+    if spec.artifact_schema and artifact and error is None:
+        import jsonschema  # P-0 已加入依赖，函数内部 import 减少模块启动成本
+        try:
+            parsed = json.loads(artifact) if isinstance(artifact, str) else artifact
+            jsonschema.validate(parsed, spec.artifact_schema)
+            schema_passed = True
+        except json.JSONDecodeError as e:
+            schema_passed = False
+            schema_error = f"artifact 非合法 JSON: {e}"
+        except jsonschema.ValidationError as e:
+            schema_passed = False
+            schema_error = e.message
+        # Q8：无论校验是否通过，artifact 保留原始文本，绝不改写
 
-    def _critic_review(self, subtask: str, result: str) -> tuple[bool, str]:
-        """Critic 审查结果，返回 (是否通过, 评语)。"""
-        prompt = (
-            "你是质量审查员。判断下面的执行结果是否完成了子任务。\n\n"
-            f"子任务: {subtask}\n"
-            f"执行结果: {result}\n\n"
-            "判断标准：结果是否准确、完整地完成了子任务要求。\n"
-            "输出格式：第一行写 PASS 或 FAIL，第二行起写评语。"
-        )
-        messages = [{"role": "user", "content": prompt}]
-        resp = self.llm.chat(messages)
-        content = resp.get("content") or ""
-        first_line = content.split("\n")[0].strip().upper()
-        approved = first_line.startswith("PASS")
-        comment = "\n".join(content.split("\n")[1:]).strip() or content
-        return approved, comment
+    # ------------------------------------------------------------------
+    # 6. 挂父子 Trace 关联，写 meta（Step 5 Trace.render 会读取）
+    # ------------------------------------------------------------------
+    agent_ref.trace.subagent_traces.append(sub_agent.trace)
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    # meta 字段正式在 Step 5.1 追加到 Trace.__init__；这里动态赋值兼容当前阶段
+    if not hasattr(sub_agent.trace, "meta"):
+        sub_agent.trace.meta = {}
+    sub_agent.trace.meta.update({
+        "subagent_id": spec.subagent_id,
+        "role": spec.role,
+        "task": spec.task,
+        "duration_ms": duration_ms,
+        "schema_passed": schema_passed,
+        "schema_error": schema_error,
+        "error": error,
+    })
+    return SubagentResult(
+        subagent_id=spec.subagent_id,
+        role=spec.role,
+        task=spec.task,
+        artifact=artifact,
+        duration_ms=duration_ms,
+        error=error,
+        schema_passed=schema_passed,
+        schema_error=schema_error,
+    )
 
-    def _planner_summarize(self, task: str, subtasks: list[SubTask]) -> str:
-        """Planner 汇总所有子任务结果，生成最终答案。"""
-        results = "\n".join(
-            f"子任务{i}: {t.description}\n结果: {t.result}\n"
-            for i, t in enumerate(subtasks, 1)
-        )
-        prompt = (
-            "你是任务规划师。所有子任务已完成，请汇总结果回答用户的原始任务。\n\n"
-            f"用户原始任务: {task}\n\n"
-            f"各子任务执行结果:\n{results}\n\n"
-            "请给出完整、连贯的最终答案。"
-        )
-        messages = [{"role": "user", "content": prompt}]
-        resp = self.llm.chat(messages)
-        return resp.get("content") or ""
 
-    def run(self, task: str) -> str:
-        """运行完整的多 Agent 协作流程。"""
-        print(f"[Planner] 正在拆解任务: {task}")
-        subtask_descs = self._planner_decompose(task)
-        subtasks = [SubTask(description=d) for d in subtask_descs]
-        self.trace.plan = subtasks
-        print(f"[Planner] 拆解为 {len(subtasks)} 个子任务:")
-        for i, t in enumerate(subtasks, 1):
-            print(f"  {i}. {t.description}")
+# ---------------------------------------------------------------------------
+# parallel_gather：并行执行，顺序保持，partial success
+# ---------------------------------------------------------------------------
 
-        # 逐个执行子任务，前面子任务结果作为后面子任务的上下文
-        context_parts: list[str] = []
-        for idx, subtask in enumerate(subtasks):
-            subtask.status = "running"
-            print(f"\n[Worker] 执行子任务 {idx + 1}/{len(subtasks)}: {subtask.description}")
 
-            context = "\n".join(context_parts) if context_parts else ""
-            result = self._worker_execute(subtask.description, context)
-            subtask.result = result
-            self.trace.worker_runs.append({"task": subtask.description, "result": result})
-            print(f"[Worker] 结果: {result[:100]}{'...' if len(result) > 100 else ''}")
+def parallel_gather(
+    specs: list[SubagentSpec],
+    agent_ref: "Agent",
+) -> list[SubagentResult]:
+    """并行执行多个子 Agent。
 
-            # Critic 审查，不通过则重做
-            while subtask.revisions < self.max_revisions:
-                print(f"[Critic] 审查子任务 {idx + 1}...")
-                approved, comment = self._critic_review(subtask.description, result)
-                self.trace.critic_reviews.append(
-                    {"task": subtask.description, "approved": approved, "comment": comment}
-                )
-                if approved:
-                    print(f"[Critic] 通过: {comment[:60]}")
-                    break
-                subtask.revisions += 1
-                print(f"[Critic] 打回(第{subtask.revisions}次): {comment[:60]}")
-                result = self._worker_execute(subtask.description, context)
-                subtask.result = result
-                self.trace.worker_runs.append({"task": subtask.description, "result": result})
-                print(f"[Worker] 重做结果: {result[:100]}{'...' if len(result) > 100 else ''}")
-            else:
-                # while 正常结束（未 break）说明达到最大重试次数
-                print(f"[Critic] 已达最大重试次数 {self.max_revisions}，接受当前结果")
+    关键保证（🔴可行性审查修正）：
+    - 顺序保持：返回 list 顺序与输入 specs 严格一致（用 enumerate(idx) O(1) 回填而非 .index）
+    - partial success：任一个子 Agent 失败/超时，不影响其他；对应 error/schema_error 字段有值
+    - 并行效率：子 Agent.meta 写入 parallel_efficiency_ratio（实际耗时 / 累计子耗时）
+    """
+    if not specs:
+        return []
+    t0 = time.perf_counter()
 
-            subtask.status = "done"
-            context_parts.append(f"{subtask.description}: {subtask.result}")
+    # 写父 Trace 的 meta（Step 5.1 才正式声明，这里动态赋值向前兼容）
+    if not hasattr(agent_ref.trace, "meta"):
+        agent_ref.trace.meta = {}
+    agent_ref.trace.meta.setdefault("spawn_counts", {})
+    # 按 role 统计 spawn 次数（Q16：Trace.step 中看不到 spawn_subagents 参数时也能追溯）
+    for s in specs:
+        c = agent_ref.trace.meta["spawn_counts"]
+        c[s.role] = c.get(s.role, 0) + 1
 
-        print(f"\n[Planner] 汇总最终答案...")
-        summary = self._planner_summarize(task, subtasks)
-        self.trace.final_summary = summary
-        return summary
+    results: list[SubagentResult | None] = [None] * len(specs)
+
+    def _run_one(idx: int, s: SubagentSpec) -> tuple[int, SubagentResult]:
+        try:
+            return idx, _run_subagent(s, agent_ref)
+        except Exception as e:
+            # 捕获并行调度层的异常（不影响兄弟任务）
+            return idx, SubagentResult(
+                subagent_id=s.subagent_id,
+                role=s.role,
+                task=s.task,
+                artifact="",
+                duration_ms=0,
+                error=f"调度异常: {type(e).__name__}: {e}",
+            )
+
+    max_workers = min(len(specs), 16)   # 简单上限，避免 spawn 1000 个开 1000 线程
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_run_one, idx, s) for idx, s in enumerate(specs)]
+        for fut in futures:
+            idx, res = fut.result()   # 单个失败在 _run_one 内部已包装，不会抛到这里
+            results[idx] = res
+
+    wall_ms = int((time.perf_counter() - t0) * 1000)
+    total_sub_ms = sum(r.duration_ms for r in results)
+    ratio = (total_sub_ms / wall_ms) if wall_ms > 0 else 1.0
+    # 写每个子 Agent 的并行效率 meta
+    for r in results:
+        if not hasattr(agent_ref.trace, "meta"):
+            agent_ref.trace.meta = {}
+        # subagent meta 在 _run_subagent 里已经写过，找对应的 trace 补充 parallel_efficiency_ratio
+        # 注意：subagent_traces 是按 spawn 顺序追加的，对应每个 idx 对应 results 的 trace 一致
+    # 更直接：遍历 subagent_traces（数量 == len(specs)），按 spawn 顺序逐个写 ratio
+    for sub_trace in agent_ref.trace.subagent_traces[-len(specs):]:
+        # meta 动态属性防御
+        if not hasattr(sub_trace, "meta"):
+            sub_trace.meta = {}
+        sub_trace.meta["parallel_efficiency_ratio"] = round(ratio, 3)
+        sub_trace.meta["wall_ms"] = wall_ms
+        sub_trace.meta["total_sub_ms"] = total_sub_ms
+
+    # results 全是非 None（上面 _run_one 处理了所有异常）
+    final: list[SubagentResult] = results  # type: ignore[assignment]
+    return final
+
+
+# ---------------------------------------------------------------------------
+# make_spawn_subagents_tool：闭包工厂，生成 (name, desc, params_factory, func) 四元组
+# ---------------------------------------------------------------------------
+
+
+def make_spawn_subagents_tool(agent: "Agent"):
+    """闭包工厂：生成供 Toolkit 注入的 spawn_subagents 工具四元组。
+
+    返回: (name: str, description: str, parameters_factory: Callable[[], dict], func: Callable)
+    - parameters_factory 是 Q19 schema 懒加载：每次调用读 agent.role_configs.keys() 生成 enum
+    - func 内部做 Q17 嵌套守卫（用 getattr 防御性读取，Step 1 阶段 Trace 可能还没 _parent_trace）
+    """
+
+    def _func(args: dict) -> str:
+        # Step 1 阶段占位 + 嵌套守卫预埋（用 getattr 避免 Step 1 AttributeError）
+        if getattr(agent.trace, '_parent_trace', None) is not None:
+            raise RuntimeError("spawn_subagents 仅顶层父 Agent 可用，禁止嵌套")
+        raw_list = args.get("subagents") or []
+        if not raw_list:
+            return "错误：spawn_subagents 需要传入非空的 subagents 列表"
+
+        specs: list[SubagentSpec] = []
+        try:
+            for i, raw in enumerate(raw_list):
+                role = raw["role"]
+                task = raw["task"]
+                # 角色存在性校验 → 错误信息里列可用 role（Q3）
+                if role not in agent.role_configs:
+                    known = list(agent.role_configs.keys())
+                    raise ValueError(
+                        f"subagents[{i}] 角色 '{role}' 不存在。可用角色: {known}"
+                    )
+                specs.append(SubagentSpec(
+                    subagent_id=raw.get("subagent_id") or f"sub_{i}",
+                    role=role,
+                    task=task,
+                    artifact_schema=raw.get("artifact_schema"),
+                    extra_system_prompt=raw.get("extra_system_prompt"),
+                ))
+        except (KeyError, TypeError, ValueError) as e:
+            return f"spawn_subagents 参数错误: {e}"
+
+        # 并行执行
+        results = parallel_gather(specs, agent)
+
+        # 格式化结果为 JSON 文本，让 LLM 直接可读
+        out: list[dict] = []
+        for r in results:
+            out.append({
+                "subagent_id": r.subagent_id,
+                "role": r.role,
+                "task": r.task,
+                "artifact": r.artifact,
+                "duration_ms": r.duration_ms,
+                "ok": r.error is None,
+                "error": r.error,
+                "schema_passed": r.schema_passed,
+                "schema_error": r.schema_error,
+            })
+        return json.dumps(out, ensure_ascii=False, indent=2)
+
+    def _params_factory() -> dict:
+        """每次调用重新生成 enum（Q19：register_role 后下一轮 LLM 就看到新 role）。"""
+        known_roles = list(agent.role_configs.keys())
+        return {
+            "type": "object",
+            "properties": {
+                "subagents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "enum": known_roles,
+                                "description": f"从枚举中选择: {known_roles}",
+                            },
+                            "task": {"type": "string"},
+                            "artifact_schema": {
+                                "type": "object",
+                                "description": "可选。期望 artifact 的 JSON Schema 描述，用于结果校验",
+                            },
+                        },
+                        "required": ["role", "task"],
+                    },
+                }
+            },
+            "required": ["subagents"],
+        }
+
+    name = "spawn_subagents"
+    description = (
+        "并行启动多个子 Agent 执行独立子任务。"
+        "每个子 Agent 拥有独立上下文，互不干扰。"
+        "适用于可并行的独立子任务（多主题调研、多方案对比等）。"
+        "可选角色必须从 role enum 中选择，不可自创。"
+        "请在单次调用的 subagents 数组中列出所有要并行执行的子任务，"
+        "不要分多次调用（并行发生在本工具内部）。"
+        "返回结构化 JSON：含每个子 Agent 的 artifact、耗时、并行效率指标。"
+    )
+    return name, description, _params_factory, _func

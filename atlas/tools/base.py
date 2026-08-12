@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 
@@ -12,8 +12,11 @@ class Tool:
 
     name: str
     description: str
-    parameters: dict  # JSON Schema 描述参数
+    parameters: dict  # JSON Schema 描述参数（静态默认值，首次注册占位）
     func: Callable[[dict], str]  # 接收参数字典，返回字符串结果
+    # Step 2.3 新增：Q19 schema 懒加载 factory。
+    # 非 None 时，Toolkit.to_openai_tools() 每轮调用重新生成 parameters（如 role enum 动态更新）。
+    parameters_factory: Callable[[], dict] | None = None
 
 
 class Toolkit:
@@ -42,18 +45,19 @@ class Toolkit:
         return self._tools[name]
 
     def to_openai_tools(self) -> list[dict]:
-        """转换为 OpenAI function calling 协议。"""
-        return [
-            {
+        """转换为 OpenAI function calling 协议。Q19：支持 parameters_factory 懒加载。"""
+        result: list[dict] = []
+        for t in self._tools.values():
+            params = t.parameters_factory() if t.parameters_factory else t.parameters
+            result.append({
                 "type": "function",
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
+                    "parameters": params,
                 },
-            }
-            for t in self._tools.values()
-        ]
+            })
+        return result
 
     def execute(self, name: str, arguments: str | dict) -> str:
         """按名称执行工具，arguments 支持 JSON 字符串或字典。"""

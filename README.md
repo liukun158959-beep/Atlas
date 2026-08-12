@@ -334,8 +334,8 @@ log.warning("saga.compensate.complete",
 - 基于 Function Calling 的工具调用与结果回填
 - 多轮会话记忆与结构化 trace 输出
 - **Renderer 可插拔渲染**：内核层 Protocol + PlainRenderer（默认纯文本）+ RichRenderer（终端 Markdown/LaTeX/表格/面板），注入即生效，上层不接触 rich
-- 单 Agent ReAct 循环 + 多 Agent 协作（硬编码 Planner-Worker-Critic demo，Phase 2 会被 `atlas.patterns` 模式包取代）
-- **`spawn_subagent` + `durable_gather` 并行验证 demo**：3 子 Agent 并行 fan-out，父 Agent 汇总，实测加速比 ≈ 2.5x
+- 单 Agent ReAct 循环 + 多 Agent 协作（`MultiAgentOrchestrator` Planner-Worker-Critic 模式，渲染统一走 Renderer）
+- **并行子 Agent 内核原语（Phase 2-1）**：`spawn_subagents` 工具自动注入 + `parallel_gather` ThreadPoolExecutor 并行 + 子 Agent 独立上下文 + artifact schema 校验 + Trace 父子嵌套递归渲染，实测加速比 ≈ 2.3x
 - **声明式 Role + 任务 YAML 配置**：Role 三元组（system_prompt + tools + llm_config）与父 Agent/task 统一在 YAML 中声明，改 YAML 即改行为
 - 插件体系：PluginProtocol 10 个生命周期钩子 + PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
 - 5 个 LLM provider 预设（Qwen / OpenAI / Deepseek / Moonshot / 智谱）
@@ -426,17 +426,18 @@ python examples/quickstart.py                  # 终端 Markdown 渲染
 python examples/quickstart.py --plain          # 纯文本输出（适合重定向到文件）
 ```
 
-并行子 Agent 协作示例（声明式 YAML 配置角色 + 任务）：
+并行子 Agent 协作示例（Phase 2-1 内核原语版，纯内核 API，< 100 行代码）：
 
 ```bash
-python examples/parallel_subagent_demo.py              # 默认用 examples/parallel_subagent_config.yaml
+python examples/parallel_subagent_demo.py              # 默认 RichRenderer 终端渲染
 python examples/parallel_subagent_demo.py --plain       # 纯文本模式
 ```
 
-多 Agent 协作示例（硬编码 Planner-Worker-Critic）：
+多 Agent 协作示例（Planner-Worker-Critic 架构，渲染统一走 Renderer）：
 
 ```bash
-python examples/multi_agent_demo.py
+python examples/multi_agent_demo.py                     # 默认 RichRenderer
+python examples/multi_agent_demo.py --plain             # 纯文本模式
 ```
 
 ## 项目结构
@@ -445,9 +446,10 @@ python examples/multi_agent_demo.py
 Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核
-│   │   ├── agent.py        # ReAct 循环（内置渲染器注入点）
-│   │   ├── plugin.py       # PluginProtocol + PluginManager
-│   │   └── multi_agent.py  # 多 Agent 协作 demo（硬编码 PWC，Phase 2 迁移到 atlas.patterns）
+│   │   ├── agent.py        # ReAct 循环 + role_configs/tool_specs_pool/spawn_subagents 自动注入
+│   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather + make_spawn_subagents_tool
+│   │   ├── orchestrator.py # Planner-Worker-Critic 多 Agent 协作编排器
+│   │   └── plugin.py       # PluginProtocol + PluginManager
 │   ├── render/             # 渲染层：Protocol + PlainRenderer + RichRenderer
 │   │   ├── base.py         # Renderer Protocol（5 个方法）
 │   │   ├── plain.py        # 默认纯文本实现（零依赖）
@@ -458,22 +460,22 @@ Atlas/
 │   ├── llm/                # LLM 接入层：OpenAI 兼容协议
 │   │   └── base.py
 │   ├── tools/              # 工具基座与内置工具
-│   │   ├── base.py         # Tool / Toolkit
+│   │   ├── base.py         # Tool（含 parameters_factory 懒加载） / Toolkit
 │   │   └── builtin.py      # calculator / get_current_time
 │   ├── memory/             # 会话记忆
 │   │   └── base.py
 │   ├── context/            # 执行轨迹
-│   │   └── trace.py
+│   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套
 │   ├── cli/                # CLI 子命令
 │   │   └── init.py         # atlas init：venv + 依赖安装 + .env 配置
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
 │   ├── quickstart.py       # 快速开始示例（支持 RichRenderer / --plain）
-│   ├── parallel_subagent_demo.py     # spawn_subagent + durable_gather 并行验证 demo
+│   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（纯内核 API，< 100 行）
 │   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置
-│   └── multi_agent_demo.py # 硬编码 Planner-Worker-Critic 示例
-├── docs_feishu/            # 飞书文档源文件与二维码临时目录
+│   └── multi_agent_demo.py # Planner-Worker-Critic 示例（Renderer 统一渲染）
+├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
 └── README.md
@@ -514,9 +516,9 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 
 - [ ] Tool ABI 增强（inputSchema / validateInput / isReadOnly / isConcurrencySafe）
 - [ ] Hook 机制（PreToolUse / PostToolUse / Stop / SubagentStart / SubagentStop）
-- [ ] **Role 抽象**（system_prompt + tools + llm_config 三元组，支持 YAML 声明式 + Python 编程式双轨）—— 角色定义不硬编码在内核，由上层注入
-- [ ] **`spawn_subagent` 内置工具**（durable：子 Agent 调用入 Journal；context 隔离：不复制父对话；artifact schema 校验；支持前台同步 / 后台异步两种模式）
-- [ ] **`durable_gather` 原语**（基于 Journal 的持久化并行 fan-out/gather，幂等防重，崩溃可断点续跑）—— 不重造图编排，仅做"同一套原语支撑并行"的最小集
+- [x] **Role 抽象**（`RoleConfig`：system_prompt + tool_names + temperature/max_steps/timeout_ms 三元组，Python 编程式注入，YAML 声明式由上层 `parallel_subagent_config.yaml` 承载）—— 角色定义不硬编码在内核，由上层注入
+- [x] **`spawn_subagents` 内置工具**（`make_spawn_subagents_tool` 闭包工厂 + `_inject_spawn_tool` 自动注入 + role enum 懒加载 + 嵌套守卫双保险；context 隔离：子 Agent 独立 Memory/Trace；artifact schema 校验：`jsonschema.validate` 不改写原文仅打标记）
+- [x] **`parallel_gather` 原语**（ThreadPoolExecutor 并行 fan-out/gather + enumerate O(1) 顺序保持 + partial success 错误隔离 + 并行效率 meta）—— 持久化/幂等防重留给 Journal 原语
 - [ ] 幂等键 + Saga 补偿注册
 - [ ] 预算护栏 + 三态熔断器
 - [ ] 独立 Evaluator（校验门，不让 Agent 自评）

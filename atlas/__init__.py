@@ -1,5 +1,11 @@
 """Atlas - 面向通用任务的 Agent 框架。"""
 from .core.agent import Agent
+from .core.multi_agent import (
+    RoleConfig,
+    SubagentResult,
+    SubagentSpec,
+    parallel_gather,
+)
 from .context.trace import StepRecord, Trace
 from .llm.base import LLM
 from .memory.base import Memory
@@ -16,4 +22,8 @@ __all__ = [
     "StepRecord",
     "Renderer",
     "PlainRenderer",
+    "RoleConfig",
+    "SubagentSpec",
+    "SubagentResult",
+    "parallel_gather",
 ]

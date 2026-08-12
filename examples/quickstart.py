@@ -54,18 +54,7 @@ def main() -> None:
         agent.renderer.print()
         agent.renderer.print(f"\n[User]   {q}")
         answer = agent.run(q)
-        # 轨迹改走 renderer.table() 格式化展示
-        agent.renderer.rule()
-        for step in agent.trace.steps:
-            step_rows = []
-            for i, call in enumerate(step.tool_calls, 1):
-                fn = call["function"]
-                obs = step.observations[i - 1] if i - 1 < len(step.observations) else ""
-                step_rows.append({"Action": f"{fn['name']}: {fn['arguments']}", "Observe": obs})
-            if step_rows:
-                agent.renderer.table(rows=step_rows, headers=["Action", "Observe"], title=f"Step {step.step}")
-            if step.thought:
-                agent.renderer.print(f"[Thought]  {step.thought}")
+        # Step 5.3：Agent.run 内部已自动渲染 Trace + 最终答案，外部不再手动遍历
 
         # 重置记忆与轨迹，开始下一轮独立任务
         agent.reset()
