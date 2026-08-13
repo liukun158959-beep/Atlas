@@ -381,6 +381,8 @@ log.warning("saga.compensate.complete",
 - **circuit_retry_demo.py（Phase 2.2 demo）**：4 场景断言全可复现——① flaky_api 幂等 retry_max=3 连抛 3 次 RuntimeError 第 4 次成功 ② unreliable_svc 幂等 retry_max=1 永远 TimeoutError → retry_exhausted ③ credit_card_charge 非幂等 retry_max=0 带 compensate 退款 ④ 手动触发熔断器 Open → circuit_rejected 不产生副作用；支持 `--mock --plain` 断言模式与 `--mock --dashboard` 可视模式
 - **PlannerWorkerCritic 模式包（Phase 2.3）**：`atlas.patterns.PlannerWorkerCritic` 产品级多 Agent 模式——Planner 拆解 → 串行 Worker 执行 → Critic 审查 → FAIL 打回重做（Worker 输入追加 Critic 评语 + 前一版结果）→ max_revisions 耗尽标 failed 不 abort → Planner 汇总标注；多层嵌套 Agent（Planner/Worker/Critic 都是内核 Agent 实例，Worker 通过 `worker_tools` 注入业务工具，Planner/Critic 纯文本推理）；Python while 控制 Critic 循环（LLM 只做内容判断不控制次数）；构造函数必填 2 + 可选 10 = 12 项（≤ DR-2 15 限额）；3 角色内置 system prompt 模板可覆写；返回 `PWCResult(final_answer, trace: PWCTrace)` 扁平可观测结构（plan_items / worker_runs / critic_reviews）；独立于 `atlas.core`，不进顶层导出（`from atlas.patterns import PlannerWorkerCritic`）
 - **pwc_demo.py（Phase 2.3 demo）**：5 项断言全可复现——① plan 拆解 3 项 ② Worker schema 校验 ③ Critic 打回 1 次后通过（revisions=1）④ 最终答案含关键字 ⑤ 重做 Worker 输入含 Critic 评语；FakeLLM 10 次调用精确映射 PWC 全流程；支持 `--mock --plain` 断言模式与 `--real` 真实 LLM 模式
+- **OrchestratorWorkers 模式包（Phase 2.4）**：`atlas.patterns.OrchestratorWorkers` 产品级多 Agent 模式——Anthropic +90.2% 模式：Orchestrator 动态分派 → 批间并行 Worker（ThreadPoolExecutor）→ 结果回 Orchestrator → 循环决策（dispatch/synthesize）；Python while 控制多轮循环；JSON 结构化决策输出（`{"action":"dispatch","tasks":[...]}` / `{"action":"synthesize","answer":"..."}`），缺字段直接 ValueError（消除 fallback）；max_iterations 耗尽 Python 侧强制汇总（不信任 LLM 会遵守约束）；Worker 失败 partial success（error 字段回传 Orchestrator 自主决策）；每轮结果自动累积上下文（Orchestrator + Worker 都收到）；构造函数必填 2 + 可选 9 = 11 项（≤ DR-2 15 限额）；2 角色内置 system prompt 模板可覆写；返回 `OWResult(final_answer, trace: OWTrace)` 扁平可观测结构（iterations → worker_results）；独立于 `atlas.core`，不进顶层导出（`from atlas.patterns import OrchestratorWorkers`）；与 PWC 互补（PWC=质量闭环串行，OW=效率优先并行）
+- **orchestrator_workers_demo.py（Phase 2.4 demo）**：6 项断言全可复现——① 至少 1 轮 dispatch ② 某轮含 >= 2 个并行 Worker ③ 最终 synthesize ④ 最终答案含关键字 ⑤ 上下文传递（第 2 轮 Orchestrator prompt 含第 1 轮 Worker 结果）⑥ max_iterations 强制汇总（单独实例 max_iterations=2，验证 1 轮 dispatch 后达上限 forced synthesize）；FakeLLM 7 次调用精确映射主场景（2 轮 dispatch + 1 轮 synthesize）；支持 `--mock --plain` 断言模式与 `--real` 真实 LLM 模式
 - **工作流图 Graph + Edge 控制流边（Phase 3.1）**：`atlas.core.Graph` 解释器模式（运行时遍历，不预编译）；命令式 API（`add_node`/`add_edge`/`add_conditional_edges`/`set_entry_point`/`set_exit_point`，和 LangGraph 对齐）；两类边 `Edge`（无条件跳转）+ `ConditionalEdge`（`condition(state)→key→mapping[key]` 动态路由）；节点签名 `Callable[[dict], dict]`，Agent 和普通函数都支持；统一 `dict` in/out + `state.update(output)` merge 语义；保留字 `END` 表示终止；run() 入口 lazy 验证（缺 entry_point / 节点未注册 / 无 END 可达路径 → ValueError）；终止三来源（END 节点 / `max_iterations` 兜底默认 50 / 可选 `terminator` 全局终止条件，和 Agent 对齐）；复用 `on_turn_start/on_turn_finish` 插件钩子，不新增 Graph 专属钩子
 - **ParallelNode 并行汇聚（Phase 3.1）**：`atlas.core.ParallelNode(fns)` 单节点内嵌 fan_out + and_ 汇聚；`__call__(state)` 签名和普通函数节点对齐，可直接 `add_node('p', ParallelNode([a,b,c]))`；每个 fn 收同一份 state 深拷贝（防互相污染）；结果按 fns 顺序合并成 list 放到 `state['parallel_results']`（不是完成顺序）；fail-fast 错误传播（任一 fn 抛异常 → 取消未完成 + raise，不静默吞错，DR-8 对齐）
 - **GraphTrace 扁平可观测存档（Phase 3.1）**：`Graph.run()` 返回 `GraphResult(final_state, trace)`；`GraphTrace` 含 `node_executions`（每个节点的输入快照/输出/耗时/错误）+ `edge_routings`（from_node/condition_key/to_node 路由决策链）+ 起止时间 + 总耗时 + iterations + terminated_by；trace 完全扁平，不做嵌套，便于 Dashboard 直接渲染
@@ -494,6 +496,13 @@ python examples/pwc_demo.py --mock                       # Rich 渲染（若可�
 python examples/pwc_demo.py --real                       # 真实 LLM（需 .env 配置）
 ```
 
+OrchestratorWorkers 动态分派示例（Phase 2.4 模式包，Orchestrator 动态分派 + 批间并行 Worker）：
+
+```bash
+python examples/orchestrator_workers_demo.py --mock --plain   # 断言模式，100% 可复现
+python examples/orchestrator_workers_demo.py --real            # 真实 LLM（需 .env 配置）
+```
+
 Phase 1 地基新能力示例（全部支持 `--mock` 用 FakeLLM 跑逻辑、`--plain` 纯文本）：
 
 ```bash
@@ -538,6 +547,11 @@ python examples/circuit_retry_demo.py --mock --dashboard
 # 定位差异：parallel_subagent_demo = 并行加速（纯 fan-out，无依赖、无 Critic）
 #           pwc_demo = 质量闭环（串行 + Critic 打回重做，不求快但求稳）
 python examples/pwc_demo.py --mock --plain
+
+# Phase 2.4：OrchestratorWorkers 动态分派（6 项断言全可复现）
+# 定位差异：pwc_demo = 质量闭环（串行 + Critic）
+#           orchestrator_workers_demo = 效率优先（并行 + 动态分派，多轮决策循环）
+python examples/orchestrator_workers_demo.py --mock --plain
 
 # Phase 3.1：Edge 控制流边（条件分支 + 循环 + state 传递，5 项断言全可复现）
 # start -> worker -> (条件边: answer 含"完善" ? end : refine) -> worker(loop) / END
@@ -613,9 +627,10 @@ Atlas/
 │   │   ├── init.py         # atlas init：venv + 依赖安装 + .env 配置
 │   │   └── dashboard.py    # Phase 1 第二批 + Phase 2.2 增强：HTTP(8765)+WebSocket(8766) Dashboard + publish() 推送 API + RESILIENCE 横幅三表（熔断器/重试/告警）
 │   ├── patterns/           # Phase 2.3 新增：产品级多 Agent 模式包（独立于 atlas.core，仅组合内核原语）
-│   │   ├── __init__.py     # re-export PlannerWorkerCritic / PWCResult / PWCTrace（不进 atlas 顶层导出）
+│   │   ├── __init__.py     # re-export PlannerWorkerCritic / PWCResult / PWCTrace / OrchestratorWorkers / OWResult / OWTrace（不进 atlas 顶层导出）
 │   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
-│   │   └── planner_worker_critic.py # PlannerWorkerCritic 主实现 + PWCResult/PWCTrace/PlanItem/WorkerRun/CriticReview dataclass + 3 角色内置 prompt + _parse_plan/_parse_critic
+│   │   ├── planner_worker_critic.py # Phase 2.3 PlannerWorkerCritic 主实现 + 5 dataclass + 3 角色 prompt + _parse_plan/_parse_critic
+│   │   └── orchestrator_workers.py  # Phase 2.4 OrchestratorWorkers 主实现 + 4 dataclass + 2 角色 prompt + _parse_orchestrator_json
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -624,6 +639,7 @@ Atlas/
 │   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（YAML 声明式配置，< 120 行，--config 可指定）
 │   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置（被 yaml_loader 读取）
 │   ├── pwc_demo.py         # Phase 2.3 新增：PlannerWorkerCritic 质量闭环 demo（5 项断言：plan 拆解 / schema 校验 / Critic 打回重做 / 关键字 / 评语注入；FakeLLM 10 次调用精确映射）
+│   ├── orchestrator_workers_demo.py # Phase 2.4 新增：OrchestratorWorkers 动态分派 demo（6 项断言：dispatch 轮次 / 并行 Worker / synthesize / 关键字 / 上下文传递 / max_iterations 强制汇总；FakeLLM 7 次调用精确映射）
 │   ├── tool_abi_demo.py    # Tool ABI 增强：三分类标志 + validate_input 通过/失败演示 + compensate 注册
 │   ├── journal_replay_demo.py  # Journal event sourcing：12 事件全生命周期 + replay 聚合
 │   ├── terminator_demo.py  # 终止条件组合器：MaxSteps/Timeout/RepetitionDetector 三种触发
@@ -699,8 +715,15 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 
 - [x] **PlannerWorkerCritic**（质量闭环模式：Planner 拆解 → 串行 Worker 执行 → Critic 审查 → FAIL 打回重做（Worker 输入追加 Critic 评语 + 前一版结果）→ max_revisions 耗尽标 failed 不 abort → Planner 汇总标注；多层嵌套 Agent + Python while 控制 Critic 循环；构造函数必填 2 + 可选 10 = 12 项；3 角色内置 prompt 可覆写；返回 `PWCResult(final_answer, trace: PWCTrace)` 扁平结构）
 - [x] **pwc_demo.py**—— 5 项断言全可复现（plan 拆解 / schema 校验 / Critic 打回 1 次后通过 / 最终答案含关键字 / 重做 Worker 输入含 Critic 评语），FakeLLM 10 次调用精确映射 PWC 全流程，支持 `--mock --plain` 与 `--real`
-- [ ] `OrchestratorWorkers`（Anthropic +90.2% 模式：Orchestrator 动态分派任务给 Worker，结果回 Orchestrator 决策下一步，支持动态增减 Worker）—— 后移至 Phase 2.4（动态分派本质是状态机控制流，与 Phase 3 Edge 条件边在设计空间上重叠，待 Edge 原语落地后更顺滑）
-- [ ] 每个模式包自带 `examples/<pattern>_demo.py`，含"预期输出"注释，可直接运行验证（对应 EP-4）
+- [x] `OrchestratorWorkers`（Anthropic +90.2% 模式）—— Phase 2.4 完成（详见下方 2.4 节）
+- [x] 每个模式包自带 `examples/<pattern>_demo.py`—— Phase 2.4 完成（orchestrator_workers_demo.py 6 项断言）
+
+#### 2.4 产品级模式包：OrchestratorWorkers（上层可选，非内核）
+
+Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施。与 PWC 互补：PWC=质量闭环串行（Critic 打回重做），OW=效率优先并行（动态分派 + 批间并行 Worker）。
+
+- [x] **OrchestratorWorkers**（动态分派模式：Orchestrator 每轮 LLM 决策 dispatch/synthesize → dispatch 时分派 K 个子任务 → ThreadPoolExecutor 并行执行 Worker → 结果全部回 Orchestrator → 循环决策；Python while 控制多轮循环；JSON 结构化决策输出 + 缺字段 ValueError（消除 fallback）；max_iterations 耗尽 Python 侧强制汇总；Worker 失败 partial success（error 回传 Orchestrator 决策）；每轮结果自动累积上下文（Orchestrator + Worker 都收到）；构造函数必填 2 + 可选 9 = 11 项；2 角色内置 prompt 可覆写；返回 `OWResult(final_answer, trace: OWTrace)` 扁平结构）
+- [x] **orchestrator_workers_demo.py**—— 6 项断言全可复现（dispatch >=1 轮 / 并行 Worker >=2 / 最终 synthesize / 答案关键字 / 上下文传递 / max_iterations 强制汇总），FakeLLM 7 次调用精确映射主场景（2 轮 dispatch + 1 轮 synthesize），支持 `--mock --plain` 与 `--real`
 
 **模式包不做的事**：
 - 不内置领域 Prompt / 工具集（用户按场景自己注入）
