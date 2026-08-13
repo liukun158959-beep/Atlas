@@ -488,8 +488,9 @@ Phase 1 地基新能力示例（全部支持 `--mock` 用 FakeLLM 跑逻辑、`-
 # Tool ABI 增强：三分类标志 + validate_input 校验
 python examples/tool_abi_demo.py --mock
 
-# Journal event sourcing：12 事件全生命周期 + replay 聚合
+# Journal event sourcing：12 事件全生命周期 + replay 聚合；支持 --journal-backend=sqlite 持久化验证
 python examples/journal_replay_demo.py --mock --plain
+python examples/journal_replay_demo.py --mock --plain --journal-backend=sqlite
 
 # 终止条件组合器：MaxSteps / Timeout / RepetitionDetector 三种触发
 python examples/terminator_demo.py --mock --plain
@@ -554,7 +555,9 @@ Atlas/
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
 │   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire(key) context manager）
 │   ├── journal/            # 执行日志 event sourcing
-│   │   └── base.py         # JournalProtocol 扩 cache_get/cache_set + JournalEvent + InMemoryJournal（摘要模式默认，opt-in 全量 + _cache 幂等存储）
+│   │   ├── __init__.py     # re-export JournalProtocol/JournalEvent/InMemoryJournal/SQLiteJournal
+│   │   ├── base.py         # JournalProtocol(6 方法：append/get_events/replay/list_run_ids/cache_get/cache_set) + JournalEvent + InMemoryJournal（摘要模式默认 mask 敏感字段/截断 200 字，opt-in save_full_payload 全量）
+│   │   └── sqlite.py       # SQLite 持久化实现：默认 ./.atlas/journal.db（path 可覆盖，支持 :memory:）；2 表 events/cache；MAX(seq) 实时算 next_seq；check_same_thread=True + 单一 threading.Lock 全包读写；save_full_payload 行为与 InMemoryJournal 完全一致；对称实现 next_seq/make_event
 │   ├── utils/              # 工具函数（Phase 2.1 扩展：幂等键 + 副作用追踪器）
 │   │   ├── idempotency.py  # Phase 2.1 新增：derive_idempotency_key(run_id, tool_name, input) → SHA-1 40 位 + IDEMPOTENCY_USER_KEY='_idempotency_key' 常量
 │   │   ├── tracker.py      # Phase 2.1 新增：SideEffectTracker record/erase/is_empty 可观测 Saga 补偿覆盖度
@@ -627,7 +630,7 @@ Atlas/
 - [x] **Compact 机制（Summary + Boundary + 状态重注入）**—— CompactManager；默认 threshold=8000；9 段结构化 Summary 复用 Agent LLM 生成；type=compact_summary + type=compact_boundary 消息对；Attachment 作为未来 state re-injection 载体已就绪
 - [x] **历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）**—— 五步流水线：找最后 compact_boundary → 保留 system prompt + Summary + Boundary 后消息 → isMeta 分层转换（Attachment→system / Summary→assistant / Boundary→跳过）→ tool_call 配对修复（删除断裂 tool_calls 和无配对 tool 消息）→ 超阈值裁剪最旧 user/assistant 对到 target=threshold×0.7
 - [x] **Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器**—— Attachment ABC + AttachmentRegistry（register/create 模式）；重名 ValueError 拒绝 + TypeError 子类校验；to_system_reminder() 子类覆写 + to_message() Runtime 消息生成；Memory.add_attachment() 便捷写入
-- [x] **Journal（执行日志，event sourcing 恢复）**—— `InMemoryJournal` + `JournalProtocol`（SQLite 实现预留）；事件结构折中（壳 dataclass + 自由 payload dict）；摘要模式默认 mask 敏感字段 + 截断 200 字，`save_full_payload=True` opt-in 全量
+- [x] **Journal（执行日志，event sourcing 崩溃重放）**—— `InMemoryJournal` + `SQLiteJournal` 双后端（JournalProtocol 接口可插拔）；SQLite 持久化：默认 `./.atlas/journal.db`（path 可覆盖，支持 `:memory:` 临时），2 表 events/cache，`MAX(seq)` 实时算 next_seq，check_same_thread=True + 单一 `threading.Lock` 全包读写，无 WAL 不多文件；replay() 聚合与 InMemoryJournal 行为完全一致；摘要模式默认 mask 敏感字段 + 截断 200 字，`save_full_payload=True` opt-in 全量；journal_replay_demo 支持 `--journal-backend=sqlite` 同断言验证
 - [x] **Scope（按 key 隔离 Agent 实例）**—— `atlas.core.Scope` + `with scope.acquire(key) as ctx` context manager；per-key `_locks[key]` 懒创建（双 guard 锁防并发重复）+ `_states[key]` 内存 state 字典；SimpleNamespace (.key/.state) 模式；异常也释放锁并写回当前 state（不兜底回滚）；`get_state(key)` 返回只读拷贝；key 空/非 str → ValueError
 - [x] **极简 Dashboard 骨架**—— `python -m atlas dashboard --port 8765`；HTTP ThreadingHTTPServer（8765，返回内嵌字符串 HTML 免路径问题）+ WebSocket asyncio（8766，每 500ms 广播 DATASTATE snapshot）；三面板（左 Run 列表 / 中 Trace DAG 卡片缩进 / 右 Events 类型着色）；`atlas.cli.dashboard.publish(run_id, journal, trace)` 全局推送（journal 聚合 run 状态 + trace 递归打平 nodes/edges）；前端自动重连 3s
 - [x] **终止条件组合器**（MaxSteps / Timeout / TokenBudget / CostCap / RepetitionDetector）—— `|` 运算符组合，`CompositeTerminator` 任一命中即终止；默认 `MaxSteps(10) | Timeout(60_000)` 与旧版完全兼容

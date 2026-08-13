@@ -1,18 +1,20 @@
 """Journal event sourcing 演示：用 FakeLLM 跑一轮工具调用 + 一轮答案，重放事件日志。
 
 用法：
-    python examples/journal_replay_demo.py --mock   # 用 FakeLLM（无需 .env）
-    python examples/journal_replay_demo.py --plain  # 真实 LLM + 纯文本
+    python examples/journal_replay_demo.py --mock --journal-backend=inmemory  # 内存版（默认）
+    python examples/journal_replay_demo.py --mock --journal-backend=sqlite    # SQLite 持久化版（:memory:）
+    python examples/journal_replay_demo.py --mock --journal-backend=sqlite --plain
     python examples/journal_replay_demo.py          # 真实 LLM + Rich
 """
 from __future__ import annotations
 
+import argparse
 import sys
 
 from dotenv import load_dotenv
 
 from atlas.core.agent import Agent
-from atlas.journal import InMemoryJournal
+from atlas.journal import InMemoryJournal, SQLiteJournal
 from atlas.llm.base import LLM
 from atlas.render import PlainRenderer, RichRenderer
 from atlas.tools.base import Toolkit
@@ -42,12 +44,22 @@ class FakeLLM:
 
 
 def main() -> None:
-    mock = "--mock" in sys.argv
-    renderer = PlainRenderer() if "--plain" in sys.argv else RichRenderer()
-    renderer.rule("Journal Event Sourcing 演示")
+    ap = argparse.ArgumentParser(description="Journal event sourcing 演示")
+    ap.add_argument("--mock", action="store_true", help="使用 FakeLLM（不发真实请求）")
+    ap.add_argument("--plain", action="store_true", help="纯文本渲染")
+    ap.add_argument(
+        "--journal-backend",
+        choices=["inmemory", "sqlite"],
+        default="inmemory",
+        help="journal 持久化后端：inmemory=内存版（默认），sqlite=SQLite 内存库",
+    )
+    args = ap.parse_args()
 
-    # --mock 用 FakeLLM 验证逻辑；默认从 .env 加载真实 LLM
-    if mock:
+    renderer = PlainRenderer() if args.plain or not RichRenderer.available() else RichRenderer()
+    renderer.rule("Journal Event Sourcing 演示")
+    renderer.print(f"[后端] {args.journal_backend.upper()}")
+
+    if args.mock:
         llm = FakeLLM()
     else:
         load_dotenv()
@@ -58,7 +70,11 @@ def main() -> None:
         toolkit.register(**spec)
 
     # 全量模式保存完整 payload，便于重放检查
-    journal = InMemoryJournal(save_full_payload=True)
+    if args.journal_backend == "sqlite":
+        # SQLite backend: use :memory: 保证每次运行隔离（断言模式）
+        journal = SQLiteJournal(save_full_payload=True, path=":memory:")
+    else:
+        journal = InMemoryJournal(save_full_payload=True)
     agent = Agent(
         llm=llm, tools=toolkit,
         system_prompt="你是计算助手，遇到算术问题调用 calculator。",

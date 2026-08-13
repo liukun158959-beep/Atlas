@@ -12,6 +12,7 @@ from .core.multi_agent import (
     parallel_gather,
 )
 from .core.scope import Scope
+from .journal import InMemoryJournal, JournalEvent, JournalProtocol, SQLiteJournal
 from .llm.base import LLM
 from .memory.base import Memory
 from .render import PlainRenderer, Renderer
@@ -38,4 +39,8 @@ __all__ = [
     "CompactManager",
     "Transcript",
     "Scope",
+    "JournalProtocol",
+    "JournalEvent",
+    "InMemoryJournal",
+    "SQLiteJournal",
 ]
