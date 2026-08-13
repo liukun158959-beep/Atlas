@@ -22,10 +22,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..context.trace import Trace
-from ..journal.base import JournalProtocol
+from ..journal.base import JournalEvent, JournalProtocol
 from ..render import PlainRenderer, Renderer
 from .circuit_breaker import CircuitBreakerRegistry
 from .plugin import PluginManager
+from .suspend import SuspendToken
 from .terminator import Terminator
 
 if TYPE_CHECKING:
@@ -100,10 +101,14 @@ class GraphTrace:
 
 @dataclass
 class GraphResult:
-    """Graph.run() 的返回值（Q19=B）。"""
+    """Graph.run() / resume() 的返回值（Q9=A）。"""
 
     final_state: dict
     trace: GraphTrace
+    # ── Phase 3.2 新增：status/suspend_prompt/suspend_token（老代码忽略行为不变） ──
+    status: str = "completed"  # "completed" / "suspended"
+    suspend_prompt: str | None = None  # status=suspended 时的提示文本
+    suspend_token: SuspendToken | None = None  # status=suspended 时的恢复 token
 
 
 # =============================================================
@@ -231,42 +236,190 @@ class Graph:
     # =============================================================
     # 主循环（Q2=A 解释器模式）
     # =============================================================
-    def run(self, initial_state: dict | None = None) -> GraphResult:
-        """运行图。返回 GraphResult(final_state, trace)。
+    def run(
+        self,
+        initial_state: dict | None = None,
+        *,
+        suspend_timeout: float | None = None,
+    ) -> GraphResult:
+        """运行图（Phase 3.2 新增 suspend_timeout 预留参数，当前不阻塞线程）。
 
         流程：
           1. _validate() 验证图结构
           2. 从 entry_point 开始
-          3. 循环：执行节点 -> 记录 Trace -> 判断出边 -> 路由到下一节点
-          4. 终止条件：到 END / max_iterations / terminator / error
+          3. 循环：执行节点 → 记录 Trace + 可选 Journal 事件 → 判断出边 → 路由
+          4. 终止：到 END / max_iterations / terminator / error / SuspendNode 挂起
         """
         self._validate()
         state: dict = dict(initial_state or {})
         _start = time.time()
         run_id = f"graph_{int(_start * 1000)}"
         trace = GraphTrace(graph_name=self.name or "unnamed", start_ts=_start)
+        return self._run_internal(
+            state=state,
+            start_node=self._entry_point or "",
+            run_id=run_id,
+            trace=trace,
+            term_start_ts=_start,
+        )
 
-        current_node: str | None = self._entry_point
-        iterations = 0
-        terminated_by = ""
+    def resume(self, token: SuspendToken, user_input: dict) -> GraphResult:
+        """从挂起点恢复执行（Q7=A + Q14=A）。
 
-        # 构建出边索引：from_node -> list[Edge | ConditionalEdge]
+        流程：
+          1. 校验 user_input 是 dict（Q13=(2)B merge 语义）
+          2. 从 journal.get_events(token.run_id) 找 seq=token.seq 且 event_type=graph_suspend 的事件
+          3. 取事件 payload 的完整 state_snapshot（Q12=A + Q8=C 挂起点存完整快照）
+          4. state.update(user_input) 注入外部输入
+          5. append graph_resume 事件（审计链路 Q11=A）
+          6. emit on_resume 钩子（Q15=B）
+          7. 从 token.node_name 的下一条边开始路由（挂起节点不重跑 Q14=A）
+        """
+        if not isinstance(user_input, dict):
+            raise ValueError(
+                f"user_input 必须是 dict（Q13=(2)B merge 语义），实际 {type(user_input)}"
+            )
+        if self.journal is None:
+            raise ValueError("resume() 需要 Graph 注入 journal 实例（Q8=C durable 恢复依赖 Journal）")
+
+        events = self.journal.get_events(token.run_id)
+        suspend_event: JournalEvent | None = None
+        for e in events:
+            if e.seq == token.seq and e.event_type == "graph_suspend":
+                suspend_event = e
+                break
+        if suspend_event is None:
+            raise ValueError(
+                f"token 对应的 graph_suspend 事件不存在（run_id={token.run_id}, seq={token.seq}）。"
+                f" 请确认 Graph 使用了同一个 Journal 实例，且 run_id/seq 未被清理。"
+            )
+        if suspend_event.payload.get("node_name") != token.node_name:
+            raise ValueError(
+                f"token.node_name={token.node_name} 与 graph_suspend 事件 payload.node_name="
+                f"{suspend_event.payload.get('node_name')!r} 不匹配"
+            )
+
+        # Q12=A：从 graph_suspend 事件 payload 取完整 state 快照
+        state: dict = copy.deepcopy(suspend_event.payload["state_snapshot"])
+        # Q13=(2)B：merge user_input 到 state
+        state.update(user_input)
+
+        _start = time.time()
+        # 重建 trace（延续此前的 node_executions 记录可从 events 重建，这里简化：新建空 trace 只记 resume 后的执行）
+        # 若要完整 trace 合并，可遍历 events 把 graph_node_exec 转成 NodeExecution，此处留简化版
+        trace = GraphTrace(graph_name=self.name or "unnamed", start_ts=_start)
+
+        # append graph_resume 事件（审计链路）
+        resume_seq = self._journal_next_seq(token.run_id)
+        self.journal.append(JournalEvent(
+            run_id=token.run_id,
+            seq=resume_seq,
+            ts=self._journal_now_iso(),
+            event_type="graph_resume",
+            payload={
+                "node_name": token.node_name,
+                "user_input": copy.deepcopy(user_input),
+                "resumed_from_seq": token.seq,
+            },
+        ))
+
+        # emit on_resume（Q15=B 新增钩子）
+        self.plugin_manager.emit(
+            "resume",
+            run_id=token.run_id,
+            node_name=token.node_name,
+            user_input=copy.deepcopy(user_input),
+            resumed_from_seq=token.seq,
+        )
+
+        # 从 token.node_name 的下一条边开始（Q14=A 不重跑挂起节点）
+        return self._run_internal(
+            state=state,
+            start_node=None,  # None = 走"先路由 token.node_name 出边再执行下一节点"模式
+            run_id=token.run_id,
+            trace=trace,
+            term_start_ts=_start,
+            resume_from_node=token.node_name,
+        )
+
+    # =============================================================
+    # 内部：run / resume 共享的主循环
+    # =============================================================
+    def _run_internal(
+        self,
+        *,
+        state: dict,
+        start_node: str | None,
+        run_id: str,
+        trace: GraphTrace,
+        term_start_ts: float,
+        resume_from_node: str | None = None,
+    ) -> GraphResult:
+        """共享主循环。
+
+        - 首次 run：start_node=entry_point，resume_from_node=None → 先执行 start_node
+        - resume：start_node=None，resume_from_node=挂起节点名 → 先路由挂起节点出边再执行下一节点
+        """
+        # 构建出边索引
         out_edges: dict[str, list[Edge | ConditionalEdge]] = {}
         for edge in self._edges:
             out_edges.setdefault(edge.from_node, []).append(edge)
 
-        # Q6=C：terminator 上下文（和 Agent 对齐，用 SimpleNamespace）
         term_ctx = SimpleNamespace(
             step_count=0,
-            start_time=_start * 1000,
+            start_time=term_start_ts * 1000,
             total_tokens=0,
             cost_usd=0.0,
             recent_outputs=[],
         ) if self.terminator is not None else None
 
+        # Phase 3.2：SuspendNode 挂起时填充
+        suspended_result: GraphResult | None = None
+
+        current_node: str | None
+        iterations = trace.iterations
+        terminated_by = ""
+
+        if resume_from_node is not None:
+            # resume 流程：先路由 resume_from_node 的出边，得到 current_node
+            # （resume 不重跑挂起节点 Q14=A）
+            edges_current = out_edges.get(resume_from_node, [])
+            if not edges_current:
+                if resume_from_node in self._exit_points:
+                    terminated_by = "END"
+                else:
+                    raise ValueError(f"resume_from_node {resume_from_node} 无出边且非 exit_point")
+                current_node = END
+            else:
+                edge = edges_current[0]
+                if isinstance(edge, Edge):
+                    current_node = edge.to_node
+                    trace.edge_routings.append(EdgeRouting(
+                        from_node=resume_from_node,
+                        condition_key=None,
+                        to_node=current_node,
+                    ))
+                else:  # ConditionalEdge
+                    condition_key = edge.condition(state)
+                    if condition_key not in edge.mapping:
+                        raise ValueError(
+                            f"resume 条件边 condition 返回 '{condition_key}' 不在 mapping {list(edge.mapping.keys())}"
+                        )
+                    current_node = edge.mapping[condition_key]
+                    trace.edge_routings.append(EdgeRouting(
+                        from_node=resume_from_node,
+                        condition_key=condition_key,
+                        to_node=current_node,
+                    ))
+        else:
+            # run 流程：从 start_node 执行
+            current_node = start_node or ""
+            if not current_node:
+                raise ValueError("_run_internal 首次 run 必须传 start_node")
+
         try:
             while current_node != END and iterations < self.max_iterations:
-                # Q6=C：terminator 兜底（和 Agent 对齐）
+                # terminator 兜底
                 if self.terminator is not None and term_ctx is not None:
                     should_stop, reasons = self.terminator.should_stop(term_ctx)
                     if should_stop:
@@ -276,10 +429,10 @@ class Graph:
                 iterations += 1
                 if term_ctx is not None:
                     term_ctx.step_count = iterations
-                assert current_node is not None  # 循环条件保证
+                assert current_node is not None
                 fn = self._nodes[current_node]
 
-                # Q26=A：复用 on_turn_start（把节点执行映射为 turn 语义）
+                # 复用 on_turn_start（Q26=A）
                 self.plugin_manager.emit(
                     "turn_start",
                     run_id=run_id,
@@ -287,7 +440,6 @@ class Graph:
                     context={"node_name": current_node, "graph_name": trace.graph_name},
                 )
 
-                # 执行节点
                 t0 = time.time()
                 input_snapshot = copy.deepcopy(state)
                 error_msg: str | None = None
@@ -297,28 +449,103 @@ class Graph:
                 except Exception as e:
                     error_msg = f"{type(e).__name__}: {e}"
                     if self.raise_on_error:
-                        raise  # fail-fast（Q14=B 对齐）
-                    # raise_on_error=False：记录到 trace 继续
+                        raise
                     output_state = {"__error__": error_msg}
                 duration_ms = int((time.time() - t0) * 1000)
 
-                # merge output_state 到 state（Q4=A merge 语义）
+                # merge 到 state（Q4=A）
                 state.update(output_state)
 
-                # 记录 NodeExecution（Q23=A）
-                trace.node_executions.append(NodeExecution(
+                # 记录 Trace NodeExecution
+                node_exec = NodeExecution(
                     node_name=current_node,
                     input_state=input_snapshot,
                     output_state=output_state,
                     duration_ms=duration_ms,
                     error=error_msg,
-                ))
+                )
+                trace.node_executions.append(node_exec)
 
-                # 收集 recent_outputs 给 terminator（repetition_detector 用）
+                # Phase 3.2：graph_node_exec Journal 事件（journal 非 None 时才 append）
+                if self.journal is not None:
+                    seq = self._journal_next_seq(run_id)
+                    self.journal.append(JournalEvent(
+                        run_id=run_id,
+                        seq=seq,
+                        ts=self._journal_now_iso(),
+                        event_type="graph_node_exec",
+                        payload={
+                            "node_name": current_node,
+                            "input_state": input_snapshot,
+                            "output_state": copy.deepcopy(output_state),
+                            "duration_ms": duration_ms,
+                            "error": error_msg,
+                        },
+                    ))
+
+                # Phase 3.2：检测 SuspendNode 返回的 __suspend__ 标记（Q5=B）
+                if "__suspend__" in output_state:
+                    prompt = output_state["__suspend__"]
+                    # SuspendNode 必须配 Journal（消除 fallback，不允许 durable=false 误挂起）
+                    if self.journal is None:
+                        raise ValueError(
+                            "SuspendNode 需要注入 Journal 才能保证 durable。"
+                            "请在 Graph 构造函数传 journal=InMemoryJournal(save_full_payload=True)"
+                        )
+                    # Q8=C：graph_suspend 事件存完整 state 快照（=挂起时完整 state）
+                    state_snapshot = copy.deepcopy(state)
+                    suspend_seq = self._journal_next_seq(run_id)
+                    self.journal.append(JournalEvent(
+                        run_id=run_id,
+                        seq=suspend_seq,
+                        ts=self._journal_now_iso(),
+                        event_type="graph_suspend",
+                        payload={
+                            "node_name": current_node,
+                            "state_snapshot": state_snapshot,
+                            "prompt": prompt,
+                        },
+                    ))
+
+                    # Q6=A 构造 SuspendToken
+                    token = SuspendToken(run_id=run_id, node_name=current_node, seq=suspend_seq)
+
+                    # Q15=B emit on_suspend 钩子
+                    self.plugin_manager.emit(
+                        "suspend",
+                        run_id=run_id,
+                        node_name=current_node,
+                        prompt=prompt,
+                        token={"run_id": token.run_id, "node_name": token.node_name, "seq": token.seq},
+                    )
+
+                    # emit on_turn_finish（挂起也是一种 turn 结束）
+                    self.plugin_manager.emit(
+                        "turn_finish",
+                        run_id=run_id,
+                        turn_idx=iterations,
+                        decisions=[],
+                        context={"node_name": current_node, "duration_ms": duration_ms, "suspended": True},
+                    )
+
+                    # 构造挂起态 GraphResult（Q9=A）
+                    trace.end_ts = time.time()
+                    trace.total_duration_ms = int((trace.end_ts - (trace.start_ts or term_start_ts)) * 1000)
+                    trace.iterations = iterations
+                    trace.terminated_by = "suspended"
+                    suspended_result = GraphResult(
+                        final_state=state,
+                        trace=trace,
+                        status="suspended",
+                        suspend_prompt=prompt,
+                        suspend_token=token,
+                    )
+                    break  # 跳出循环，挂起
+
                 if term_ctx is not None and isinstance(output_state, dict):
                     term_ctx.recent_outputs.append(str(output_state)[:200])
 
-                # Q26=A：复用 on_turn_finish
+                # on_turn_finish（非挂起路径）
                 self.plugin_manager.emit(
                     "turn_finish",
                     run_id=run_id,
@@ -327,17 +554,14 @@ class Graph:
                     context={"node_name": current_node, "duration_ms": duration_ms},
                 )
 
-                # 判断出边
+                # 边路由（正常节点）
                 edges_from_current = out_edges.get(current_node, [])
                 if not edges_from_current:
-                    # 无出边：检查是否 exit_point
                     if current_node in self._exit_points:
                         terminated_by = "END"
                         break
-                    # 无出边且非 exit_point：报错（_validate 已防，这里是双保险）
                     raise ValueError(f"节点 {current_node} 无出边且非 exit_point")
 
-                # 取第一条边（每节点只支持一条出边，多分支用条件边表达）
                 edge = edges_from_current[0]
                 if isinstance(edge, Edge):
                     next_node = edge.to_node
@@ -346,7 +570,7 @@ class Graph:
                         condition_key=None,
                         to_node=next_node,
                     ))
-                else:  # ConditionalEdge
+                else:
                     condition_key = edge.condition(state)
                     if condition_key not in edge.mapping:
                         raise ValueError(
@@ -361,6 +585,9 @@ class Graph:
 
                 current_node = next_node
 
+            if suspended_result is not None:
+                return suspended_result
+
             if not terminated_by:
                 if current_node == END:
                     terminated_by = "END"
@@ -372,16 +599,36 @@ class Graph:
         except Exception:
             terminated_by = "error"
             trace.end_ts = time.time()
-            trace.total_duration_ms = int((trace.end_ts - _start) * 1000)
+            trace.total_duration_ms = int((trace.end_ts - (trace.start_ts or term_start_ts)) * 1000)
             trace.iterations = iterations
             trace.terminated_by = terminated_by
             raise
 
         trace.end_ts = time.time()
-        trace.total_duration_ms = int((trace.end_ts - _start) * 1000)
+        trace.total_duration_ms = int((trace.end_ts - (trace.start_ts or term_start_ts)) * 1000)
         trace.iterations = iterations
         trace.terminated_by = terminated_by
-        return GraphResult(final_state=state, trace=trace)
+        return GraphResult(final_state=state, trace=trace, status="completed")
+
+    # =============================================================
+    # 内部：Journal 辅助（对齐 atlas.journal.base 的 make_event 风格）
+    # =============================================================
+    def _journal_next_seq(self, run_id: str) -> int:
+        """通过 journal 动态拿 next_seq。
+
+        InMemoryJournal 有 next_seq() 方法；若 journal 是其他实现，
+        退化为 get_events 取最后一条 seq+1。
+        """
+        j = self.journal
+        assert j is not None
+        if hasattr(j, "next_seq") and callable(getattr(j, "next_seq")):
+            return j.next_seq(run_id)  # type: ignore[attr-defined]
+        events = j.get_events(run_id)
+        return (events[-1].seq + 1) if events else 1
+
+    def _journal_now_iso(self) -> str:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
 
 
 # =============================================================

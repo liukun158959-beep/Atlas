@@ -13,6 +13,7 @@ from .core.multi_agent import (
     parallel_gather,
 )
 from .core.scope import Scope
+from .core.suspend import SuspendNode, SuspendTimeout, SuspendToken
 from .journal import InMemoryJournal, JournalEvent, JournalProtocol, SQLiteJournal
 from .llm.base import LLM
 from .memory.base import Memory
@@ -44,6 +45,9 @@ __all__ = [
     "GraphResult",
     "GraphTrace",
     "ParallelNode",
+    "SuspendToken",
+    "SuspendNode",
+    "SuspendTimeout",
     "JournalProtocol",
     "JournalEvent",
     "InMemoryJournal",

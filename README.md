@@ -357,7 +357,7 @@ log.warning("saga.compensate.complete",
 - 单 Agent ReAct 循环 + 多 Agent 协作（`MultiAgentOrchestrator` Planner-Worker-Critic 模式，渲染统一走 Renderer）
 - **并行子 Agent 内核原语（Phase 2-1）**：`spawn_subagents` 工具自动注入 + `parallel_gather` ThreadPoolExecutor 并行 + 子 Agent 独立上下文 + artifact schema 校验 + Trace 父子嵌套递归渲染，实测加速比 ≈ 2.3x
 - **声明式 Role + 任务 YAML 配置**：Role 三元组（system_prompt + tools + llm_config）与父 Agent/task 统一在 YAML 中声明，改 YAML 即改行为
-- 插件体系：PluginProtocol 17 个生命周期钩子（基础 8 个 + Saga 3 个 `compensate_start/failed/finish` + 熔断器 3 个 `circuit_open/half_open/closed` + 重试 3 个 `retry_before/after/exhausted`）+ PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
+- 插件体系：PluginProtocol 19 个生命周期钩子（基础 8 个 + Saga 3 个 `compensate_start/failed/finish` + 熔断器 3 个 `circuit_open/half_open/closed` + 重试 3 个 `retry_before/after/exhausted` + HITL 2 个 `on_suspend/on_resume`）+ PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
 - 5 个 LLM provider 预设（Qwen / OpenAI / Deepseek / Moonshot / 智谱）
 - `atlas init` 一键引导（venv + 依赖安装 + .env 配置）
 - **Tool ABI 增强（Phase 2.1 收尾）**：compensate 字段正式入 Tool dataclass ABI；注册约束升级为 ValueError 直接拒绝（hasSideEffects=True + 非幂等 无 compensate → 抛错不兜底）；tool_status 三态：success / failed / idempotency_hit
@@ -387,6 +387,12 @@ log.warning("saga.compensate.complete",
 - **react_graph 桥接函数（Phase 3.1）**：`react_graph(agent)` 把 Agent 包装成单节点 Graph，验证"Agent 循环能用 Graph 语法表达"设计假设；最小形态单节点 Graph（`agent.run(state['input']) → {'answer': ...}`）无循环，用户要自我修正循环可 `add_conditional_edges` 自行表达
 - **edge_demo.py（Phase 3.1 demo）**：5 项断言全可复现——① 节点执行顺序 `[start, worker, worker]` ② 边路由记录 3 条（普通边 start→worker + 条件边 worker→worker(refine) + worker→END(end)）③ 最终答案含"完善" ④ `terminated_by == "END"` ⑤ worker 第 2 次输入包含第 1 次输出（验证 state 在节点间传递）
 - **parallel_edge_demo.py（Phase 3.1 demo）**：4 项断言全可复现——① 3 个 Worker 并行执行（start_ts 差值 < 50ms）② 汇聚结果 `parallel_results` 长度=3（顺序 a,b,c）③ summarizer 收到合并 state（summary=['a:20','b:30','c:110']）④ 总耗时 < 串行基准 0.300s
+- **SuspendNode Durable HITL（Phase 3.2）**：`atlas.core.SuspendNode(prompt_fn)` 专用节点类（和 ParallelNode 同风格）；节点执行时返回 `{"__suspend__": prompt}` 标记，Graph 解释器检测到即进入"挂起态"；`Graph.run()` 返回 `GraphResult(status="suspended", suspend_prompt, suspend_token=SuspendToken(run_id, node_name, seq))`，由调用方显式决定 resume 时机；无 Journal 注入时直接 ValueError 拒绝（消除 fallback，禁止非 durable 挂起）。顶层 `from atlas import SuspendNode, SuspendToken, SuspendTimeout`
+- **graph.resume(token, user_input) 恢复执行（Phase 3.2）**：在同一 Graph 实例（或同结构 + 同 Journal 新实例，模拟进程重启 durable 恢复）上调用 `graph.resume(SuspendToken, user_input_dict)` 继续执行；从挂起节点的**下一条边**开始路由（Q14=A 不重跑 SuspendNode，避免 prompt 副作用）；`user_input` 必须是 dict（否则 ValueError），以 `state.update(user_input)` merge 语义注入（和 Phase 3.1 节点输出一致 Q4=A）
+- **Journal Graph 事件三类（Phase 3.2）**：`graph_node_exec`（正常节点执行后，payload=node_name+input+output+duration+error）、`graph_suspend`（挂起点强制完整 state_snapshot + prompt，Q8=C durable 恢复源）、`graph_resume`（审计链路：node_name+user_input+resumed_from_seq）；事件 3 壳结构（run_id/seq/ts/event_type+自由 payload）和 Journal 其他事件一致
+- **PluginProtocol 扩展 2 钩子（Phase 3.2）**：新增 `on_suspend(run_id, node_name, prompt, token_dict)` + `on_resume(run_id, node_name, user_input, resumed_from_seq)`；钩子总数 17 → 19；可用于插件在挂起时暂停计时、恢复时恢复计时或外部系统通知
+- **GraphResult 三新字段（Phase 3.2）**：`status`（"completed"/"suspended"，默认"completed"—— Phase 3.1 老代码零成本忽略）、`suspend_prompt`（status=suspended 时的提示文本）、`suspend_token`（`SuspendToken` 对象或 None）；`GraphTrace.terminated_by` 新增允许值 "suspended"
+- **suspend_resume_demo.py（Phase 3.2 demo）**：7 项断言全可复现——① 挂起态 status+suspended_prompt 含订单/金额/商品 ② approved=True→shipped+SHIP-PO-999 ③ state 保留（order_id/amount/submitted）+ resume 注入（approved=True）④ approved=False→cancelled+拒绝理由 ⑤ Journal 事件链 ≥4 条（三种类型齐全）⑥ 双 Graph 实例崩溃恢复（del graph1→新建 graph2 同结构同 Journal→resume，结果和单实例 approved=True 100% 一致）⑦ `graph_resume.payload.resumed_from_seq == graph_suspend.seq`（审计链路一致）
 
 ## 技术栈
 
@@ -540,6 +546,12 @@ python examples/edge_demo.py --plain
 # Phase 3.1：Parallel 并行汇聚（ParallelNode 扇出 + and_ 汇聚，4 项断言全可复现）
 # parallel_1(3 Worker 并行各 sleep 0.1s) -> summarizer -> END，并行耗时 < 串行基准
 python examples/parallel_edge_demo.py --plain
+
+# Phase 3.2：Suspend/Resume Durable HITL（挂起 + 恢复 + 崩溃恢复，7 项断言全可复现）
+# submit_order -> wait_approval(SuspendNode) -> [suspended] -> resume(approved=True/False)
+#               -> (条件边: approved ? ship_order : cancel_order) -> END
+# 包含双 Graph 实例崩溃恢复断言：del graph -> 新建 graph(同结构+同Journal) -> resume 成功
+python examples/suspend_resume_demo.py --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -561,13 +573,14 @@ Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿 + 熔断器 + 重试）
 │   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环
-│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（17 钩子 no-op 基类：基础 8 + Saga 3 + 熔断器 3 + 重试 3）
+│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（19 钩子 no-op 基类：基础 8 + Saga 3 + 熔断器 3 + 重试 3 + HITL 2 on_suspend/on_resume）
 │   │   ├── circuit_breaker.py # Phase 2.2 新增：CircuitBreakerRegistry 三态状态机（Closed→Open→Half-Open）+ threading.Lock 线程安全 + snapshot 快照
 │   │   ├── retry.py        # Phase 2.2 新增：full_jitter_delay_ms Full Jitter 退避 + sleep_ms
 │   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()（MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector）
 │   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol（@runtime_checkable）+ ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用，Agent 不自评）
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
-│   │   ├── graph.py        # Phase 3.1 新增：Graph（解释器模式）+ Edge/ConditionalEdge + ParallelNode（fan_out+and_汇聚）+ GraphTrace/GraphResult + react_graph 桥接函数
+│   │   ├── graph.py        # Phase 3.1 新增：Graph（解释器模式）+ Edge/ConditionalEdge + ParallelNode（fan_out+and_汇聚）+ GraphTrace/GraphResult + react_graph 桥接函数；Phase 3.2 扩展：GraphResult.status/suspend_token + Graph.resume() + suspend_timeout
+│   │   ├── suspend.py      # Phase 3.2 新增：SuspendToken(run_id, node_name, seq) + SuspendTimeout 异常 + SuspendNode(prompt_fn)（Graph 专用 HITL 节点）
 │   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire(key) context manager）
 │   ├── journal/            # 执行日志 event sourcing
 │   │   ├── __init__.py     # re-export JournalProtocol/JournalEvent/InMemoryJournal/SQLiteJournal
@@ -620,7 +633,8 @@ Atlas/
 │   ├── dashboard_demo.py   # Phase 1 第二批：Dashboard 演示（后台起 server + 3 轮 mock quickstart publish）
 │   ├── circuit_retry_demo.py # Phase 2.2 新增：熔断器三态 + 指数退避重试 demo（4 场景断言：flaky 重试成功 / unreliable retry_exhausted / credit_card 非幂等补偿 / 手动熔断 circuit_rejected）
 │   ├── edge_demo.py          # Phase 3.1 新增：Edge 控制流边 demo（条件分支 + 循环 + state 传递，5 项断言：节点顺序/边路由/最终答案/terminated_by/state 传递）
-│   └── parallel_edge_demo.py # Phase 3.1 新增：Parallel 并行汇聚 demo（ParallelNode 扇出 + and_ 汇聚，4 项断言：并行执行/结果长度/汇总内容/耗时）
+│   ├── parallel_edge_demo.py # Phase 3.1 新增：Parallel 并行汇聚 demo（ParallelNode 扇出 + and_ 汇聚，4 项断言：并行执行/结果长度/汇总内容/耗时）
+│   └── suspend_resume_demo.py# Phase 3.2 新增：Suspend/Resume Durable HITL demo（7 项断言：挂起态字段/approved→发货/state保留+注入/reject→取消/Journal事件链/崩溃恢复双实例/resumed_from_seq一致）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -713,10 +727,17 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 - [x] **edge_demo.py**—— 5 项断言全可复现（节点执行顺序 / 条件边路由记录 / 最终答案 / terminated_by / state 在节点间传递）
 - [x] **parallel_edge_demo.py**—— 4 项断言全可复现（3 Worker 并行执行 / 汇聚结果长度 / summarizer 收到合并 state / 总耗时 < 串行基准）
 
-#### 3.2 Suspend/Resume（HITL，规划中）
+#### 3.2 Suspend/Resume（Durable HITL + 崩溃恢复，✓ 完成）
 
-- [ ] Suspend/Resume（durable HITL，不用进程内 sleep）—— 挂起等待外部输入，崩溃不丢，复用 Journal event sourcing 恢复
-- [ ] 可插拔持久化后端（SQLite 默认 / Temporal 可选）—— Graph 执行状态入 Journal，崩溃可断点续跑
+- [x] **SuspendNode 专用节点类**—— `atlas.core.SuspendNode(prompt_fn)`（和 ParallelNode 同风格）；节点执行返回 `{"__suspend__": prompt}` 标记触发挂起；无 Journal 注入时 `run()` 入口直接 ValueError 拒绝（消除 fallback，禁止非 durable 挂起）
+- [x] **Graph.run() 挂起态返回**—— 返回 `GraphResult(status="suspended", suspend_prompt, suspend_token=SuspendToken(run_id, node_name, seq))`；同步阻塞语义：Graph.run() 到 SuspendNode 就返挂起态，由调用方显式决定 resume 时机
+- [x] **graph.resume(token, user_input) 恢复执行**—— 同实例或"同结构 + 同 Journal 新实例（模拟进程重启 durable 恢复）"均可调用；从挂起节点的**下一条边**开始路由（不重跑 SuspendNode，避免 prompt 副作用）；user_input 必须 dict（否则 ValueError），以 `state.update(user_input)` merge 注入
+- [x] **Journal 事件三类齐全**—— `graph_node_exec`（正常节点执行后）、`graph_suspend`（挂起点强制完整 state_snapshot + prompt，O(1) durable 恢复源）、`graph_resume`（审计链路：node_name+user_input+resumed_from_seq）；3 壳结构和 Journal 其他事件一致
+- [x] **PluginProtocol 扩展 2 钩子**—— `on_suspend(run_id, node_name, prompt, token_dict)` + `on_resume(run_id, node_name, user_input, resumed_from_seq)`；钩子总数 17 → 19
+- [x] **GraphResult 扩展**—— `status`（"completed"/"suspended"，默认"completed" Phase 3.1 老代码零成本忽略）、`suspend_prompt`、`suspend_token`；`GraphTrace.terminated_by` 新增 "suspended"
+- [x] **顶层导出**—— `from atlas import SuspendNode, SuspendToken, SuspendTimeout`
+- [x] **suspend_resume_demo.py**—— 7 项断言全可复现：① 挂起态字段 ② approved=True→发货 ③ state 保留+注入 ④ approved=False→取消 ⑤ Journal 事件链 ≥4 条（三种齐全）⑥ 双 Graph 实例崩溃恢复（del→新建同结构同 Journal→resume=单实例 100% 一致）⑦ `graph_resume.payload.resumed_from_seq == graph_suspend.seq`（审计链路一致）
+- [x] **V1 单步 + V2 demo7 项 + V3 全回归**（11 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/circuit_retry/edge/parallel_edge）
 
 ### Phase 4：RSI 自进化（上下文层 + 工具层）
 

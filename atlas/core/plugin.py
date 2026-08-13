@@ -264,6 +264,35 @@ class PluginProtocol(Protocol):
         """所有重试耗尽，工具最终标记失败之前。"""
         ...
 
+    # ------------------------------------------------------------------
+    # Graph Suspend/Resume（Phase 3.2 HITL）
+    # ------------------------------------------------------------------
+
+    def on_suspend(
+        self,
+        *,
+        run_id: str,
+        node_name: str,
+        prompt: str,
+        token: dict[str, Any],
+    ) -> None:
+        """Graph 执行到 SuspendNode 挂起。
+
+        token 形如 {"run_id": ..., "node_name": ..., "seq": ...}。
+        """
+        ...
+
+    def on_resume(
+        self,
+        *,
+        run_id: str,
+        node_name: str,
+        user_input: dict[str, Any],
+        resumed_from_seq: int,
+    ) -> None:
+        """外部调用 graph.resume() 恢复执行。"""
+        ...
+
 
 # ----------------------------------------------------------------------
 # 基类：实现所有钩子为 no-op，子类按需覆写
@@ -340,6 +369,12 @@ class BasePlugin:
         pass
 
     def on_retry_exhausted(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, total_attempts: int, last_error: str) -> None:
+        pass
+
+    def on_suspend(self, *, run_id: str, node_name: str, prompt: str, token: dict[str, Any]) -> None:
+        pass
+
+    def on_resume(self, *, run_id: str, node_name: str, user_input: dict[str, Any], resumed_from_seq: int) -> None:
         pass
 
 
