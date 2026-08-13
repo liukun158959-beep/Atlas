@@ -379,6 +379,8 @@ log.warning("saga.compensate.complete",
 - **PluginProtocol 扩展 7 钩子（Phase 2.2）**：新增 `on_circuit_open/half_open/closed`（熔断器三态切换）+ `on_retry_before/after/exhausted`（重试前后与耗尽）+ `on_compensate_finish`（补齐 Saga 单步补偿完成）；钩子总数 10 → 17
 - **Dashboard RESILIENCE 横幅（Phase 2.2）**：Dashboard 顶部新增 RESILIENCE 横幅，并排三表：① 熔断器状态表（circuit_key / state / failure_count / open_seconds，OPEN 红 / HALF 黄 / CLOSED 绿）② 最近重试记录表（tool_name / attempt / next_delay_ms / error_type，ring buffer 200 条）③ 活动告警表（Open 超 60s 红色高亮）；DATASTATE 扩 `circuit_breakers`/`retry_logs`/`alerts` 三 key，由 `CircuitBreakerRegistry.snapshot()` 产出
 - **circuit_retry_demo.py（Phase 2.2 demo）**：4 场景断言全可复现——① flaky_api 幂等 retry_max=3 连抛 3 次 RuntimeError 第 4 次成功 ② unreliable_svc 幂等 retry_max=1 永远 TimeoutError → retry_exhausted ③ credit_card_charge 非幂等 retry_max=0 带 compensate 退款 ④ 手动触发熔断器 Open → circuit_rejected 不产生副作用；支持 `--mock --plain` 断言模式与 `--mock --dashboard` 可视模式
+- **PlannerWorkerCritic 模式包（Phase 2.3）**：`atlas.patterns.PlannerWorkerCritic` 产品级多 Agent 模式——Planner 拆解 → 串行 Worker 执行 → Critic 审查 → FAIL 打回重做（Worker 输入追加 Critic 评语 + 前一版结果）→ max_revisions 耗尽标 failed 不 abort → Planner 汇总标注；多层嵌套 Agent（Planner/Worker/Critic 都是内核 Agent 实例，Worker 通过 `worker_tools` 注入业务工具，Planner/Critic 纯文本推理）；Python while 控制 Critic 循环（LLM 只做内容判断不控制次数）；构造函数必填 2 + 可选 10 = 12 项（≤ DR-2 15 限额）；3 角色内置 system prompt 模板可覆写；返回 `PWCResult(final_answer, trace: PWCTrace)` 扁平可观测结构（plan_items / worker_runs / critic_reviews）；独立于 `atlas.core`，不进顶层导出（`from atlas.patterns import PlannerWorkerCritic`）
+- **pwc_demo.py（Phase 2.3 demo）**：5 项断言全可复现——① plan 拆解 3 项 ② Worker schema 校验 ③ Critic 打回 1 次后通过（revisions=1）④ 最终答案含关键字 ⑤ 重做 Worker 输入含 Critic 评语；FakeLLM 10 次调用精确映射 PWC 全流程；支持 `--mock --plain` 断言模式与 `--real` 真实 LLM 模式
 
 ## 技术栈
 
@@ -472,11 +474,12 @@ python examples/parallel_subagent_demo.py              # 默认 RichRenderer 终
 python examples/parallel_subagent_demo.py --plain       # 纯文本模式
 ```
 
-多 Agent 协作示例（Planner-Worker-Critic 架构，渲染统一走 Renderer）：
+PlannerWorkerCritic 质量闭环示例（Phase 2.3 模式包，串行 + Critic 打回重做）：
 
 ```bash
-python examples/multi_agent_demo.py                     # 默认 RichRenderer
-python examples/multi_agent_demo.py --plain             # 纯文本模式
+python examples/pwc_demo.py --mock --plain              # 断言模式，100% 可复现
+python examples/pwc_demo.py --mock                       # Rich 渲染（若可用）
+python examples/pwc_demo.py --real                       # 真实 LLM（需 .env 配置）
 ```
 
 Phase 1 地基新能力示例（全部支持 `--mock` 用 FakeLLM 跑逻辑、`--plain` 纯文本）：
@@ -517,6 +520,11 @@ python -m atlas dashboard --port 8765
 python examples/circuit_retry_demo.py --mock --plain
 # 断言 + 后台起 Dashboard 看 RESILIENCE 横幅三表（熔断器状态/重试记录/告警）
 python examples/circuit_retry_demo.py --mock --dashboard
+
+# Phase 2.3：PlannerWorkerCritic 质量闭环（5 项断言全可复现）
+# 定位差异：parallel_subagent_demo = 并行加速（纯 fan-out，无依赖、无 Critic）
+#           pwc_demo = 质量闭环（串行 + Critic 打回重做，不求快但求稳）
+python examples/pwc_demo.py --mock --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -544,7 +552,6 @@ Atlas/
 │   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()（MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector）
 │   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol（@runtime_checkable）+ ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用，Agent 不自评）
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
-│   │   ├── orchestrator.py # Planner-Worker-Critic 多 Agent 协作编排器（Renderer 统一渲染）
 │   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire(key) context manager）
 │   ├── journal/            # 执行日志 event sourcing
 │   │   └── base.py         # JournalProtocol 扩 cache_get/cache_set + JournalEvent + InMemoryJournal（摘要模式默认，opt-in 全量 + _cache 幂等存储）
@@ -574,6 +581,10 @@ Atlas/
 │   ├── cli/                # CLI 子命令
 │   │   ├── init.py         # atlas init：venv + 依赖安装 + .env 配置
 │   │   └── dashboard.py    # Phase 1 第二批 + Phase 2.2 增强：HTTP(8765)+WebSocket(8766) Dashboard + publish() 推送 API + RESILIENCE 横幅三表（熔断器/重试/告警）
+│   ├── patterns/           # Phase 2.3 新增：产品级多 Agent 模式包（独立于 atlas.core，仅组合内核原语）
+│   │   ├── __init__.py     # re-export PlannerWorkerCritic / PWCResult / PWCTrace（不进 atlas 顶层导出）
+│   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
+│   │   └── planner_worker_critic.py # PlannerWorkerCritic 主实现 + PWCResult/PWCTrace/PlanItem/WorkerRun/CriticReview dataclass + 3 角色内置 prompt + _parse_plan/_parse_critic
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -581,7 +592,7 @@ Atlas/
 │   ├── saga_demo.py        # Phase 2.1 新增：Saga 补偿完整流程（write_po + charge 成功 → ship FAIL-SHIP-500 → MaxSteps(3) 终止 → LIFO 补偿清零；SideEffectTracker 断言）
 │   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（YAML 声明式配置，< 120 行，--config 可指定）
 │   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置（被 yaml_loader 读取）
-│   ├── multi_agent_demo.py # Planner-Worker-Critic 示例（Renderer 统一渲染）
+│   ├── pwc_demo.py         # Phase 2.3 新增：PlannerWorkerCritic 质量闭环 demo（5 项断言：plan 拆解 / schema 校验 / Critic 打回重做 / 关键字 / 评语注入；FakeLLM 10 次调用精确映射）
 │   ├── tool_abi_demo.py    # Tool ABI 增强：三分类标志 + validate_input 通过/失败演示 + compensate 注册
 │   ├── journal_replay_demo.py  # Journal event sourcing：12 事件全生命周期 + replay 聚合
 │   ├── terminator_demo.py  # 终止条件组合器：MaxSteps/Timeout/RepetitionDetector 三种触发
@@ -648,12 +659,13 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 - [x] **Dashboard Resilience 横幅**—— 顶部三表实时展示熔断器状态（OPEN 红/HALF 黄/CLOSED 绿）、最近重试记录（ring buffer 200 条）、活动告警（Open 超 60s 红色高亮）
 - [x] **circuit_retry_demo.py**—— 4 场景断言全可复现（flaky 重试成功 / unreliable retry_exhausted / credit_card 非幂等补偿 / 手动熔断 circuit_rejected），支持 `--mock --plain` 与 `--mock --dashboard`
 
-#### 2.3 多 Agent 模式包（上层可选，非内核）
+#### 2.3 产品级模式包：PlannerWorkerCritic（上层可选，非内核）
 
 模式包定位为"参考实现 + 可直接组装的产品级模式"，位于 `atlas.patterns`（独立于 `atlas.core`）。用户可以不用这些包、只用内核原语自己组装任意模式；也可以引用其中一种作为起点。模式包之间互不依赖，按需引入。
 
-- [ ] `PlannerWorkerCritic`（最常用模式参考实现：任务分解 → 并行 Worker → Critic 反馈 → 结果聚合，基于 `spawn_subagent` + `durable_gather` 组装）
-- [ ] `OrchestratorWorkers`（Anthropic +90.2% 模式：Orchestrator 动态分派任务给 Worker，结果回 Orchestrator 决策下一步，支持动态增减 Worker）
+- [x] **PlannerWorkerCritic**（质量闭环模式：Planner 拆解 → 串行 Worker 执行 → Critic 审查 → FAIL 打回重做（Worker 输入追加 Critic 评语 + 前一版结果）→ max_revisions 耗尽标 failed 不 abort → Planner 汇总标注；多层嵌套 Agent + Python while 控制 Critic 循环；构造函数必填 2 + 可选 10 = 12 项；3 角色内置 prompt 可覆写；返回 `PWCResult(final_answer, trace: PWCTrace)` 扁平结构）
+- [x] **pwc_demo.py**—— 5 项断言全可复现（plan 拆解 / schema 校验 / Critic 打回 1 次后通过 / 最终答案含关键字 / 重做 Worker 输入含 Critic 评语），FakeLLM 10 次调用精确映射 PWC 全流程，支持 `--mock --plain` 与 `--real`
+- [ ] `OrchestratorWorkers`（Anthropic +90.2% 模式：Orchestrator 动态分派任务给 Worker，结果回 Orchestrator 决策下一步，支持动态增减 Worker）—— 后移至 Phase 2.4（动态分派本质是状态机控制流，与 Phase 3 Edge 条件边在设计空间上重叠，待 Edge 原语落地后更顺滑）
 - [ ] 每个模式包自带 `examples/<pattern>_demo.py`，含"预期输出"注释，可直接运行验证（对应 EP-4）
 
 **模式包不做的事**：
