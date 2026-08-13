@@ -410,6 +410,8 @@ log.warning("saga.compensate.complete",
 - **Leakage Guardrails（Phase 4.2b）**：`atlas.rsi.LeakageGuard` Protocol（`check(prompt) -> LeakageCheckResult(passed, matched_patterns)`）+ `RegexLeakageGuard`（内置默认 ~10 个中英文越狱模式 ignore previous/忽略以上/you are now/你现在是/system override/jailbreak/DAN/忽略所有规则/disregard above/new instructions + `extra_patterns` 可追加，预编译正则忽略大小写）；在 fitness 通过后、apply 前执行，命中即 archive 为 failed（EvaluationResult(passed=False, feedback="leakage detected: [matched]")）
 - **Agent Prompt 进化方法（Phase 4.2b）**：`Agent.evolve_prompt() -> EvolutionResult` 委托 `atlas.rsi.evolve_prompt()`（和 self_evolve 并列，内部复用 4.2a apply_diff system_prompt 分支）；`EvolutionResult(generation, proposal, evaluation, leakage_check, applied)` 携带完整进化轨迹；Agent 构造函数新增 `fitness_evaluator` + `leakage_guard` 可选参数 + `generation: int = 0` 计数器（apply 成功后 +1，零侵入）
 - **prompt_evolution_demo.py（Phase 4.2b demo）**：8 项断言全可复现——① 返回 EvolutionResult ② fitness score ∈ [0,1] ③ 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）④ LeakageGuard 拦截越狱 ⑤ apply 后 system_prompt 替换（generation 0→1）⑥ archive 记录通过+失败 ⑦ 多代进化（gen2 fitness 0.8 > gen1 0.4）⑧ RegexLeakageGuard 正则黑名单命中（matched_patterns 非空）
+- **收敛检测 + 多代回滚（Phase 4.2b 增强）**：`EvolutionSummary(generations, final_generation, final_score, stop_reason)` 多代汇总；`Agent.evolve_prompt_until_converged(max_generations=10, convergence_n=3, convergence_threshold=0.01, no_progress_n=3)` 委托 `atlas.rsi.evolve_prompt_until_converged()`，三种停止条件（converged=连续 N 代 apply 成功 fitness 提升 < threshold / max_generations=达上限 / no_progress=连续 N 代未 apply 成功）；`Agent.rollback_to(target_generation)` 委托 `atlas.rsi.rollback_to()`，target=0 恢复第 1 代提案的 current_value（原始 prompt），target=N 恢复第 N 代提案的 proposed_value，同步回退 `agent.generation`，无对应通过提案直接 ValueError（不兜底）；`ArchiveStore` 扩 `ArchivedProposal.generation`（apply 成功时 = agent.generation，失败 = -1）+ `list_by_generation(generation)` + `get_passed_at(generation)`（每代至多 1 条通过）
+- **prompt_converge_rollback_demo.py（Phase 4.2b 增强 demo）**：8 项断言全可复现——① 返回 EvolutionSummary ② Part 1 converged（Part1ConvergenceFitness 0.2→0.5→0.7→0.71→0.72→0.72→0.721，最近 3 代 [0.72,0.72,0.721] deltas=[0,0.001] max=0.001<0.01，共 7 代收敛）③ Part 2 max_generations（max_generations=2 只跑 2 代停止）④ Part 3 no_progress（Part3NoProgressThenSuccess 0.3→0.2→0.4 连续 3 低分未 apply，stop_reason=no_progress，共 3 代）⑤ rollback_to(0) 恢复原始 prompt + generation=0 ⑥ rollback_to(1) 恢复第 1 代 proposed_value + generation=1 ⑦ generations 列表长度（P1=7 / P2=2 / P3=3）⑧ rollback generation 回退（gen2=2 → rb0=0 → rb1=1）
 
 ## 技术栈
 
@@ -597,6 +599,12 @@ python examples/prompt_evolution_demo.py --plain
 # TaskSetFitnessEvaluator：真实适应度评估（跑任务集 + Schema/关键字打分，6 项断言全可复现）
 # FakeLLM 根据 prompt 质量返回不同答案 → 低质量 prompt score=0.0 / 高质量 prompt score=1.0
 python examples/taskset_fitness_demo.py --plain
+
+# Phase 4.2b 增强：收敛检测 + 多代回滚（8 项断言全可复现）
+# 3 场景：Part 1 收敛（plateau 0.7→0.71→0.721，convergence_n=3 threshold=0.01）
+#        Part 2 max_generations（只跑 2 代停止）
+#        Part 3 no_progress（连续 3 代低分未 apply）+ rollback_to(0/1) 恢复
+python examples/prompt_converge_rollback_demo.py --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -617,7 +625,7 @@ assert ok, reasons
 Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿 + 熔断器 + 重试）
-│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环；Phase 4.1 skill_library/failure_memory 参数 + inspect_self() + bind_agent 自动注入
+│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环；Phase 4.1 skill_library/failure_memory 参数 + inspect_self() + bind_agent 自动注入；Phase 4.2a propose_diff/self_evolve；Phase 4.2b evolve_prompt + generation 计数器；Phase 4.2b增强 evolve_prompt_until_converged/rollback_to
 │   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（19 钩子 no-op 基类：基础 8 + Saga 3 + 熔断器 3 + 重试 3 + HITL 2 on_suspend/on_resume）
 │   │   ├── circuit_breaker.py # Phase 2.2 新增：CircuitBreakerRegistry 三态状态机（Closed→Open→Half-Open）+ threading.Lock 线程安全 + snapshot 快照
 │   │   ├── retry.py        # Phase 2.2 新增：full_jitter_delay_ms Full Jitter 退避 + sleep_ms
@@ -662,17 +670,17 @@ Atlas/
 │   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
 │   │   ├── planner_worker_critic.py # Phase 2.3 PlannerWorkerCritic 主实现 + 5 dataclass + 3 角色 prompt + _parse_plan/_parse_critic
 │   │   └── orchestrator_workers.py  # Phase 2.4 OrchestratorWorkers 主实现 + 4 dataclass + 2 角色 prompt + _parse_orchestrator_json
-│   ├── rsi/                # Phase 4.1 新增：RSI 自进化基础设施（独立于 core，和 patterns 同级）；Phase 4.2a 追加自进化闭环；Phase 4.2b 追加 Prompt 进化
-│   │   ├── __init__.py     # re-export 4.1 全部 + 4.2a PermissionLevel/check_permission/ArchivedProposal/ArchiveStore/ProposedDiff/EvaluationResult/propose_diff/evaluate/apply_diff/self_evolve + 4.2b FitnessEvaluator/FitnessResult/FakeFitnessEvaluator/LeakageGuard/LeakageCheckResult/RegexLeakageGuard/EvolutionResult/evolve_prompt
+│   ├── rsi/                # Phase 4.1 新增：RSI 自进化基础设施（独立于 core，和 patterns 同级）；Phase 4.2a 追加自进化闭环；Phase 4.2b 追加 Prompt 进化 + 收敛回滚
+│   │   ├── __init__.py     # re-export 4.1 全部 + 4.2a PermissionLevel/check_permission/ArchivedProposal/ArchiveStore/ProposedDiff/EvaluationResult/propose_diff/evaluate/apply_diff/self_evolve + 4.2b FitnessEvaluator/FitnessResult/FakeFitnessEvaluator/TaskSetFitnessEvaluator/LeakageGuard/LeakageCheckResult/RegexLeakageGuard/EvolutionResult/evolve_prompt + 4.2b增强 EvolutionSummary/evolve_prompt_until_converged/rollback_to
 │   │   ├── embedding.py    # EmbeddingProtocol（embed/embed_batch/dimension）+ FakeEmbedding（MD5 hash 64 维确定性）+ OpenAIEmbedding（复用 LLM client）
 │   │   ├── vector_store.py # VectorStoreProtocol（add/query/get/delete/count）+ VectorHit + SQLiteVectorStore（bytes 存 SQLite + 纯 Python 余弦相似度）
 │   │   ├── skill.py        # Skill dataclass（name/description/code/embedding/version/fitness_score）+ SkillLibrary（register/retrieve/get/list_all/latest_version）+ to_tool()
 │   │   ├── failure.py      # FailureCase dataclass + FailureMemory（record/retrieve/list_recent）+ FailureMemoryCollector(BasePlugin)（挂 3 钩子 + weakref 读 Agent 上下文）
 │   │   ├── inspector.py    # SelfSnapshot dataclass（5 字段）+ build_self_snapshot(agent)
-│   │   ├── archive.py      # Phase 4.2a 新增：PermissionLevel 枚举（CORE/BUFFERED/FREE）+ check_permission() + ArchivedProposal + ArchiveStore（add/list_recent/list_failed/list_passed/count）
+│   │   ├── archive.py      # Phase 4.2a 新增：PermissionLevel 枚举（CORE/BUFFERED/FREE）+ check_permission() + ArchivedProposal（4.2b扩 generation 字段）+ ArchiveStore（add/list_recent/list_failed/list_passed/count + 4.2b扩 list_by_generation/get_passed_at）
 │   │   ├── evolver.py      # Phase 4.2a 新增：ProposedDiff + EvaluationResult dataclass + propose_diff/evaluate/apply_diff/self_evolve + _parse_json（容错）+ _test_skill_code（exec + 同名函数存在）
 │   │   ├── fitness.py      # Phase 4.2b 新增：FitnessResult dataclass + FitnessEvaluator Protocol + FakeFitnessEvaluator（0.4/0.8/0.3 确定性序列）+ TaskSetFitnessEvaluator（真实接口预留骨架）
-│   │   └── prompt_evolver.py # Phase 4.2b 新增：LeakageCheckResult + LeakageGuard Protocol + RegexLeakageGuard（默认 ~10 中英文越狱模式 + extra_patterns）+ EvolutionResult + evolve_prompt（反思式变异闭环）+ _build_evolution_prompt/_extract_fitness_history/_extract_archived_failures
+│   │   └── prompt_evolver.py # Phase 4.2b 新增：LeakageCheckResult + LeakageGuard Protocol + RegexLeakageGuard（默认 ~10 中英文越狱模式 + extra_patterns）+ EvolutionResult + evolve_prompt（反思式变异闭环）+ 4.2b增强 EvolutionSummary（多代汇总三停止条件）+ evolve_prompt_until_converged（收敛/上限/无进展）+ rollback_to（按代回滚 system_prompt + generation）+ _build_evolution_prompt/_extract_fitness_history/_extract_archived_failures
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -696,7 +704,8 @@ Atlas/
 │   ├── rsi_demo.py          # Phase 4.1 新增：RSI 自进化基础设施 demo（8 项断言：SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self 空值零侵入 + FakeEmbedding 确定性）
 │   ├── rsi_evolution_demo.py# Phase 4.2a 新增：RSI 自进化闭环 demo（7 项断言：propose_diff + 权限校验 + 测试通过 + 测试拒绝不调 LLM + Critic 通过 + apply 版本递增 + archive 失败反馈）
 │   ├── prompt_evolution_demo.py # Phase 4.2b 新增：Prompt 进化 demo（8 项断言：EvolutionResult + fitness score + 反思式变异 + Leakage 拦截 + apply 替换 + archive 通过+失败 + 多代 fitness 上升 + 正则黑名单命中）
-│   └── taskset_fitness_demo.py # TaskSetFitnessEvaluator demo（6 项断言：FitnessResult + score ∈ [0,1] + task_results 长度 + 低质 prompt 0.0 + 高质 prompt 1.0 + feedback 详情）
+│   ├── taskset_fitness_demo.py # TaskSetFitnessEvaluator demo（6 项断言：FitnessResult + score ∈ [0,1] + task_results 长度 + 低质 prompt 0.0 + 高质 prompt 1.0 + feedback 详情）
+│   └── prompt_converge_rollback_demo.py # Phase 4.2b 增强：收敛检测 + 多代回滚 demo（8 项断言：EvolutionSummary + converged/MaxGenerations/NoProgress 三停止 + rollback 恢复原始/第1代 + generation 回退）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -838,6 +847,12 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 - [x] **Leakage Guardrails**—— `LeakageGuard` Protocol（`check(prompt) -> LeakageCheckResult(passed, matched_patterns)`）+ `RegexLeakageGuard`（内置默认 ~10 个中英文越狱模式 + `extra_patterns` 可追加，预编译正则忽略大小写）；在 fitness 通过后、apply 前执行，命中即 archive 为 failed
 - [x] **evolve_prompt() 闭环**—— `Agent.evolve_prompt() -> EvolutionResult(generation, proposal, evaluation, leakage_check, applied)`（和 self_evolve 并列，内部复用 4.2a apply_diff system_prompt 分支）；Agent 新增 `fitness_evaluator` + `leakage_guard` 可选参数 + `generation: int = 0` 计数器（apply 成功后 +1，零侵入）
 - [x] **prompt_evolution_demo.py**—— 8 项断言全可复现：EvolutionResult / fitness score ∈ [0,1] / 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）/ LeakageGuard 拦截越狱 / apply 后 system_prompt 替换（generation 0→1）/ archive 记录通过+失败 / 多代进化（gen2 0.8 > gen1 0.4）/ RegexLeakageGuard 正则黑名单命中
+- [x] **收敛检测（三停止条件）**—— `EvolutionSummary(generations, final_generation, final_score, stop_reason)` 汇总；`evolve_prompt_until_converged(max_generations=10, convergence_n=3, convergence_threshold=0.01, no_progress_n=3)` 循环：仅用 apply 成功代的 fitness 算收敛（applied_scores 最近 N 代 deltas 最大值 < threshold → converged）；到达 max_generations → max_generations；连续 N 代未 apply → no_progress；`STOP_CONVERGED/MAX_GENERATIONS/NO_PROGRESS` 三字符串常量
+- [x] **多代回滚（durable 代数恢复）**—— `rollback_to(target_generation)`：target=0 恢复第 1 代通过提案的 proposal.current_value（原始 prompt，snapshot 强制覆盖 LLM 返回值，不可信）；target=N≥1 恢复第 N 代通过提案的 proposal.proposed_value；同步 `agent.generation = target_generation`（回退一致）；无对应通过提案直接 ValueError（不兜底，消除 fallback）；复用 apply_diff 复用 system_prompt 替换逻辑
+- [x] **ArchiveStore 按代查询**—— `ArchivedProposal.generation` 字段（apply 成功传 `agent.generation` 新代，失败 -1）；`list_by_generation(generation)` 返回指定代所有归档；`get_passed_at(generation)` 返回指定代通过提案（每代至多 1 条）；回滚完全依赖 archive，无其他持久化状态
+- [x] **Agent 方法追加**—— `Agent.evolve_prompt_until_converged(max_generations, convergence_n, convergence_threshold, no_progress_n)` 委托 rsi；`Agent.rollback_to(target_generation)` 委托 rsi；和 evolve_prompt/self_evolve 风格一致（Agent 薄封装 + rsi 主实现）
+- [x] **prompt_converge_rollback_demo.py**—— 8 项断言全可复现：① EvolutionSummary 类型 ② Part 1 converged（Part1ConvergenceFitness 0.2→0.5→0.7→0.71→0.72→0.72→0.721 共 7 代，最近 3 代 [0.72,0.72,0.721] deltas=[0,0.001] max=0.001<0.01）③ Part 2 max_generations=2（只跑 2 代，stop=max_generations）④ Part 3 no_progress（连续 3 代 fitness<0.5 未 apply，stop=no_progress）⑤ rollback_to(0) 恢复原始 prompt + generation=0 ⑥ rollback_to(1) 恢复第 1 代 proposed_value + generation=1 ⑦ generations 列表长度（P1=7 / P2=2 / P3=3）⑧ rollback generation 回退（gen2=2 → rb0=0 → rb1=1）
+- [x] **V1 单步 + V2 两个 demo 16 项 + V3 全回归**（21 demo 通过：tool_abi/terminator/plugin_cost/saga/compact/scope/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/taskset_fitness/prompt_evolution/prompt_converge_rollback + 其他回归；journal_replay/circuit_retry 因旧 RichRenderer.available() 遗留报错非本次修改，其余全绿）
 - [x] **V1 单步 + V2 demo 8 项 + V3 全回归**（19 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/dashboard/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/tool_abi/prompt_evolution）
 - [x] **FREE 层说明**—— 4.2b 实际在 BUFFERED 层（system_prompt 受控修改 + evaluate + leakage 门控），FREE 自由层沙箱留给未来工具自生成场景
 

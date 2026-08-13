@@ -40,6 +40,8 @@ class ArchivedProposal:
     proposal: object          # ProposedDiff（避免循环引用，用 object）
     evaluation: object        # EvaluationResult
     archived_at: float = 0.0
+    # Q4=A：显式记录代数。apply 成功时 = agent.generation（进化代），失败时 = -1（未进入代数体系）
+    generation: int = -1
 
 
 class ArchiveStore:
@@ -53,12 +55,21 @@ class ArchiveStore:
     def __init__(self) -> None:
         self._archive: list[ArchivedProposal] = []
 
-    def add(self, proposal: object, evaluation: object) -> None:
-        """归档一条提案（含评估结果）。"""
+    def add(
+        self,
+        proposal: object,
+        evaluation: object,
+        generation: int = -1,
+    ) -> None:
+        """归档一条提案（含评估结果）。
+
+        generation: apply 成功时传 agent.generation（进化代），失败时不传（-1 默认）。
+        """
         self._archive.append(ArchivedProposal(
             proposal=proposal,
             evaluation=evaluation,
             archived_at=time.time(),
+            generation=generation,
         ))
 
     def list_recent(self, n: int = 10) -> list[ArchivedProposal]:
@@ -76,3 +87,21 @@ class ArchiveStore:
     def count(self) -> int:
         """当前归档总数。"""
         return len(self._archive)
+
+    def list_by_generation(self, generation: int) -> list[ArchivedProposal]:
+        """返回指定代数的所有归档提案。
+
+        generation=0 时返回 generation 字段为 -1 或 0 的提案（进化前的失败/未标注代）。
+        """
+        return [
+            a for a in self._archive
+            if a.generation == generation or (generation == 0 and a.generation == -1)
+        ]
+
+    def get_passed_at(self, generation: int) -> ArchivedProposal | None:
+        """返回指定代通过的提案（每代最多一条），不存在返回 None。"""
+        passed = [
+            a for a in self._archive
+            if a.generation == generation and a.evaluation.passed
+        ]
+        return passed[0] if passed else None

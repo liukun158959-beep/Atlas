@@ -203,6 +203,38 @@ class Agent:
         from ..rsi.prompt_evolver import evolve_prompt
         return evolve_prompt(self)
 
+    # ------------------------------------------------------------------
+    # Phase 4.2b 增强：收敛检测 + 回滚
+    # ------------------------------------------------------------------
+
+    def evolve_prompt_until_converged(
+        self,
+        max_generations: int = 10,
+        convergence_n: int = 3,
+        convergence_threshold: float = 0.01,
+        no_progress_n: int = 3,
+    ) -> Any:
+        """多代进化直到收敛/达上限/无进展，返回 EvolutionSummary。
+
+        委托给 atlas.rsi.evolve_prompt_until_converged()。
+        """
+        from ..rsi.prompt_evolver import evolve_prompt_until_converged
+        return evolve_prompt_until_converged(
+            self,
+            max_generations=max_generations,
+            convergence_n=convergence_n,
+            convergence_threshold=convergence_threshold,
+            no_progress_n=no_progress_n,
+        )
+
+    def rollback_to(self, target_generation: int) -> None:
+        """回滚到指定代数（target_generation=0 恢复初始状态）。
+
+        委托给 atlas.rsi.rollback_to()。Q7=A：agent.generation 同步回退。
+        """
+        from ..rsi.prompt_evolver import rollback_to
+        rollback_to(self, target_generation)
+
     def _journal_append(self, run_id: str, event_type: str, payload: dict) -> None:
         """便捷方法：向 Journal 追加事件（若 journal 未注入则跳过）。"""
         if self.journal:

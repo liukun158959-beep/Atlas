@@ -34,10 +34,13 @@ from .fitness import FakeFitnessEvaluator, FitnessEvaluator, FitnessResult, Task
 from .inspector import SelfSnapshot, build_self_snapshot
 from .prompt_evolver import (
     EvolutionResult,
+    EvolutionSummary,
     LeakageCheckResult,
     LeakageGuard,
     RegexLeakageGuard,
     evolve_prompt,
+    evolve_prompt_until_converged,
+    rollback_to,
 )
 from .skill import Skill, SkillLibrary
 from .vector_store import SQLiteVectorStore, VectorHit, VectorStoreProtocol
@@ -85,4 +88,8 @@ __all__ = [
     # Phase 4.2b：Prompt 进化闭环
     "EvolutionResult",
     "evolve_prompt",
+    # Phase 4.2b 增强：收敛检测 + 回滚
+    "EvolutionSummary",
+    "evolve_prompt_until_converged",
+    "rollback_to",
 ]
