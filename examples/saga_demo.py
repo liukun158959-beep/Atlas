@@ -96,21 +96,21 @@ def main() -> None:
         description="创建采购单（非幂等，有副作用）", compensate=delete_purchase_order,
         parameters={"type": "object", "required": ["po_id", "items"],
                     "properties": {"po_id": {"type": "string"}, "items": {"type": "array"}}},
-        hasSideEffects=True, isIdempotent=False,
+        hasSideEffects=True, isIdempotent=False, retry_max=0,
     )
     toolkit.register(
         func=charge_payment, name="charge_payment",
         description="扣款支付（非幂等，有副作用）", compensate=refund_payment,
         parameters={"type": "object", "required": ["txn_id", "amount_usd"],
                     "properties": {"txn_id": {"type": "string"}, "amount_usd": {"type": "number"}}},
-        hasSideEffects=True, isIdempotent=False,
+        hasSideEffects=True, isIdempotent=False, retry_max=0,
     )
     toolkit.register(
         func=ship_goods, name="ship_goods",
         description="发货出库（非幂等，有副作用；ship_id=FAIL-* 抛 5xx）", compensate=cancel_shipment,
         parameters={"type": "object", "required": ["ship_id"],
                     "properties": {"ship_id": {"type": "string"}}},
-        hasSideEffects=True, isIdempotent=False,
+        hasSideEffects=True, isIdempotent=False, retry_max=0,
     )
 
     # 2. 构造 Agent（--mock 用 SagaFakeLLM，max_steps=2 确保两轮后触发 Saga）

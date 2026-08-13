@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..context.trace import Trace
+    from ..circuit_breaker import CircuitBreakerRegistry
     from ..journal.base import JournalProtocol
 
 
@@ -34,6 +35,9 @@ DATASTATE: dict[str, Any] = {
     "events": [],
     "trace_nodes": [],
     "trace_edges": [],
+    "circuit_breakers": [],
+    "retry_logs": [],
+    "alerts": [],
     "last_publish_ts": None,
 }
 
@@ -109,8 +113,13 @@ def _trace_to_graph(trace: "Trace", _prefix: str = "root", _parent_node_id: str 
     return nodes, edges
 
 
-def publish(run_id: str, journal: "JournalProtocol | None", trace: "Trace | None") -> None:
-    """用户代码调：把 run/journal/trace 快照序列化到全局 DATASTATE。
+def publish(
+    run_id: str,
+    journal: "JournalProtocol | None",
+    trace: "Trace | None",
+    circuit_breaker_registry: "CircuitBreakerRegistry | None" = None,
+) -> None:
+    """用户代码调：把 run/journal/trace + CircuitBreakerRegistry 快照序列化到全局 DATASTATE。
 
     线程安全：DATASTATE 每次全量覆盖（单写多读 + threading.Lock 双保险）。
     """
@@ -118,6 +127,9 @@ def publish(run_id: str, journal: "JournalProtocol | None", trace: "Trace | None
     events: list[dict] = []
     nodes: list[dict] = []
     edges: list[dict] = []
+    circuit_breakers: list[dict] = []
+    retry_logs: list[dict] = []
+    alerts: list[dict] = []
 
     if journal:
         all_run_ids = [run_id]
@@ -166,11 +178,24 @@ def publish(run_id: str, journal: "JournalProtocol | None", trace: "Trace | None
     if trace:
         nodes, edges = _trace_to_graph(trace)
 
+    if circuit_breaker_registry is not None:
+        try:
+            snap = circuit_breaker_registry.snapshot()
+            circuit_breakers = snap.get("circuit_breakers", [])
+            retry_logs = snap.get("retry_logs", [])
+            alerts = snap.get("alerts", [])
+        except Exception:
+            # snapshot 异常绝不阻塞 publish
+            pass
+
     with _DATASTATE_LOCK:
         DATASTATE["runs"] = runs
         DATASTATE["events"] = events
         DATASTATE["trace_nodes"] = nodes
         DATASTATE["trace_edges"] = edges
+        DATASTATE["circuit_breakers"] = circuit_breakers
+        DATASTATE["retry_logs"] = retry_logs
+        DATASTATE["alerts"] = alerts
         DATASTATE["last_publish_ts"] = time.time()
 
 
@@ -196,6 +221,23 @@ html, body { margin:0; padding:0; height:100vh; font-family: Consolas, Menlo, mo
 .header h1 { margin:0; font-size:15px; color:#8aa4ff; font-weight:600; letter-spacing:1px; }
 .header .status { font-size:12px; color:#7a7d89; }
 .columns { display:flex; height: calc(100vh - 41px); }
+/* ================ Phase 2.2 RESILIENCE 横幅（header 下 columns 上） ================ */
+.banner { padding:8px 14px; background:#181c28; border-bottom:1px solid #2a2d3a; display:flex; gap:10px; align-items:flex-start; }
+.banner-title { writing-mode: vertical-lr; transform: rotate(180deg); font-size:11px; color:#ff6b6b; letter-spacing:2px; font-weight:700; padding:4px 2px; border-left:2px solid #ff6b6b; user-select:none; min-width:14px; }
+.banner .tbl-wrap { flex:1; min-width:0; background:#0f1117; border:1px solid #2a2d3a; border-radius:3px; }
+.banner .tbl-wrap h3 { margin:0; padding:4px 8px; font-size:11px; color:#abb2bf; background:#1a1d29; border-bottom:1px solid #2a2d3a; letter-spacing:0.5px; }
+.banner table { width:100%; border-collapse:collapse; font-size:10.5px; }
+.banner th, .banner td { padding:3px 7px; text-align:left; border-bottom:1px solid #1e2130; word-break:break-all; }
+.banner th { background:#161922; color:#8aa4ff; font-weight:600; position:sticky; top:0; }
+.banner .scroller { max-height:110px; overflow:auto; }
+/* 熔断器状态颜色 */
+.st-open   { background:#4a2a2a !important; color:#ff8a8a !important; font-weight:700; }
+.st-half   { background:#4a4020 !important; color:#e5c07b !important; font-weight:600; }
+.st-closed { background:#2a3a2c !important; color:#7be495 !important; }
+/* 告警严重度 */
+.alert-critical { color:#ff6b6b; font-weight:700; }
+.alert-warning  { color:#e5c07b; font-weight:600; }
+.columns { display:flex; height: calc(100vh - 41px - 138px); }
 .col { overflow:auto; padding:10px 12px; }
 .col-left  { width:22%; border-right:1px solid #2a2d3a; }
 .col-mid   { width:48%; border-right:1px solid #2a2d3a; background:#13151e; }
@@ -237,6 +279,33 @@ html, body { margin:0; padding:0; height:100vh; font-family: Consolas, Menlo, mo
   <h1>◆ Atlas Dashboard</h1>
   <div class="status" id="status">connecting…</div>
 </div>
+
+<!------------ Phase 2.2 RESILIENCE 横幅：三表并排 ------------>
+<div class="banner">
+  <div class="banner-title">RESILIENCE</div>
+  <div class="tbl-wrap">
+    <h3>① 熔断器状态 (CIRCUIT BREAKERS)</h3>
+    <div class="scroller"><table>
+      <thead><tr><th>CIRCUIT KEY</th><th>STATE</th><th>FAIL COUNT</th><th>OPEN 剩余(s)</th><th>LAST CHANGE</th></tr></thead>
+      <tbody id="tbl-circuit-body"><tr><td colspan="5" class="empty-hint">(无熔断器数据)</td></tr></tbody>
+    </table></div>
+  </div>
+  <div class="tbl-wrap">
+    <h3>② 最近重试记录 (RETRY LOGS)</h3>
+    <div class="scroller"><table>
+      <thead><tr><th>TIME</th><th>TOOL</th><th>#</th><th>ERROR</th><th>DELAY(ms)</th></tr></thead>
+      <tbody id="tbl-retry-body"><tr><td colspan="5" class="empty-hint">(无重试记录)</td></tr></tbody>
+    </table></div>
+  </div>
+  <div class="tbl-wrap">
+    <h3>③ 活动告警 (ALERTS)</h3>
+    <div class="scroller"><table>
+      <thead><tr><th>LEVEL</th><th>MESSAGE</th><th>SINCE</th></tr></thead>
+      <tbody id="tbl-alerts-body"><tr><td colspan="3" class="empty-hint">(无告警)</td></tr></tbody>
+    </table></div>
+  </div>
+</div>
+
 <div class="columns">
   <div class="col col-left">
     <div class="col-title">RUNS</div>
@@ -329,6 +398,68 @@ function renderEvents(events) {
   box.scrollTop = box.scrollHeight;
 }
 
+/* -------- Phase 2.2 RESILIENCE 横幅渲染 -------- */
+function stateCls(s) {
+  s = String(s || '').toLowerCase();
+  if (s === 'open') return 'st-open';
+  if (s === 'half_open' || s === 'half-open') return 'st-half';
+  return 'st-closed';
+}
+function stateTxt(s) {
+  s = String(s || '').toLowerCase();
+  if (s === 'open') return '● OPEN';
+  if (s === 'half_open' || s === 'half-open') return '◐ HALF-OPEN';
+  return '○ CLOSED';
+}
+function fmtTs(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString() + '.' + String(d.getMilliseconds()).padStart(3,'0');
+}
+function renderCircuit(rows) {
+  const tb = document.getElementById('tbl-circuit-body');
+  if (!rows || !rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty-hint">(无熔断器数据)</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => `<tr>
+    <td>${esc(r.key)}</td>
+    <td class="${stateCls(r.state)}">${stateTxt(r.state)}</td>
+    <td>${r.failure_count ?? 0}</td>
+    <td>${r.open_remain_secs ?? 0}</td>
+    <td>${fmtTs(r.last_state_change_ts)}</td>
+  </tr>`).join('');
+}
+function renderRetry(rows) {
+  const tb = document.getElementById('tbl-retry-body');
+  if (!rows || !rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty-hint">(无重试记录)</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.slice(-50).reverse().map(r => `<tr>
+    <td>${fmtTs(r.ts)}</td>
+    <td>${esc(r.tool_name || '')}</td>
+    <td>#${r.attempt ?? '?'}</td>
+    <td>${esc(r.error_type || '')}</td>
+    <td>${r.next_delay_ms ?? '-'}</td>
+  </tr>`).join('');
+}
+function renderAlerts(rows) {
+  const tb = document.getElementById('tbl-alerts-body');
+  if (!rows || !rows.length) {
+    tb.innerHTML = '<tr><td colspan="3" class="empty-hint">(无告警)</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => {
+    const cls = String(r.level || '').toLowerCase() === 'critical' ? 'alert-critical' : 'alert-warning';
+    return `<tr>
+      <td class="${cls}">${esc(r.level || 'info').toUpperCase()}</td>
+      <td>${esc(r.message || '')}</td>
+      <td>${fmtTs(r.since_ts)}</td>
+    </tr>`;
+  }).join('');
+}
+
 function update(data) {
   lastData = data;
   document.getElementById('status').textContent =
@@ -336,6 +467,9 @@ function update(data) {
   renderRuns(data.runs);
   renderDag(data.trace_nodes);
   renderEvents(data.events);
+  renderCircuit(data.circuit_breakers);
+  renderRetry(data.retry_logs);
+  renderAlerts(data.alerts);
 }
 
 function connect() {

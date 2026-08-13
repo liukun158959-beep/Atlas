@@ -64,7 +64,7 @@ def main() -> None:
             },
             "required": ["path", "content"],
         },
-        hasSideEffects=True, isIdempotent=False,
+        hasSideEffects=True, isIdempotent=False, retry_max=0,
     )
     # 3. 幂等工具：set_flag（有副作用但幂等，重放安全）
     tk.register(

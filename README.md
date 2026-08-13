@@ -206,6 +206,13 @@ class Tool:
     compensate: Callable[[dict, Any, dict], dict] | None = None
     # compensate 签名：compensate(compensate_input, original_result, context) → dict
     #   hasSideEffects=True + isIdempotent=False 必须非 None，否则 Toolkit.register() 抛 ValueError 拒绝
+    circuit_key: str | None = None
+    # 熔断器隔离键。None 时运行时 fallback 为 tool_name。同 circuit_key 共用一个熔断器
+    retry_on: tuple[type[Exception], ...] = (TimeoutError, ConnectionError)
+    # 触发自动重试的异常白名单。空 tuple=永不重试。仅 isIdempotent=True 生效
+    retry_max: int = 3
+    # 最大重试次数。0=永不重试（总尝试次数 = 1 次原执行 + retry_max 次重试）
+    #   非幂等工具 retry_max>0 会被 Toolkit.register() 直接 ValueError 拒绝（消除 fallback 场景）
 
     def validate_input(self, input: dict) -> None:
         """按 parameters JSON Schema 校验输入，失败抛 jsonschema.ValidationError。"""
@@ -350,7 +357,7 @@ log.warning("saga.compensate.complete",
 - 单 Agent ReAct 循环 + 多 Agent 协作（`MultiAgentOrchestrator` Planner-Worker-Critic 模式，渲染统一走 Renderer）
 - **并行子 Agent 内核原语（Phase 2-1）**：`spawn_subagents` 工具自动注入 + `parallel_gather` ThreadPoolExecutor 并行 + 子 Agent 独立上下文 + artifact schema 校验 + Trace 父子嵌套递归渲染，实测加速比 ≈ 2.3x
 - **声明式 Role + 任务 YAML 配置**：Role 三元组（system_prompt + tools + llm_config）与父 Agent/task 统一在 YAML 中声明，改 YAML 即改行为
-- 插件体系：PluginProtocol 10 个生命周期钩子（含 `compensate_start/compensate_finish/compensate_failed` 新增 3 个）+ PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
+- 插件体系：PluginProtocol 17 个生命周期钩子（基础 8 个 + Saga 3 个 `compensate_start/failed/finish` + 熔断器 3 个 `circuit_open/half_open/closed` + 重试 3 个 `retry_before/after/exhausted`）+ PluginManager 错误隔离分发，预置 TokenCostPlugin / FileLoggerPlugin
 - 5 个 LLM provider 预设（Qwen / OpenAI / Deepseek / Moonshot / 智谱）
 - `atlas init` 一键引导（venv + 依赖安装 + .env 配置）
 - **Tool ABI 增强（Phase 2.1 收尾）**：compensate 字段正式入 Tool dataclass ABI；注册约束升级为 ValueError 直接拒绝（hasSideEffects=True + 非幂等 无 compensate → 抛错不兜底）；tool_status 三态：success / failed / idempotency_hit
@@ -366,6 +373,12 @@ log.warning("saga.compensate.complete",
 - **极简 Dashboard 骨架（Phase 1 第二批）**：`python -m atlas dashboard --port 8765` 一键启动；HTTP(8765) ThreadingHTTPServer 子线程 + WebSocket(8766) asyncio 当前线程；HTML 三面板字符串内嵌（免读文件路径问题）；左 Run 列表（run_id/status/event_count/step_count/start→end）+ 中 Trace DAG（StepRecord 卡片 + 子 Trace 缩进 + tool_names 绿标）+ 右 Events（最近 200 条，类型着色）；WebSocket 每 500ms 广播 DATASTATE snapshot；`atlas.cli.dashboard.publish(run_id, journal, trace)` 全局 API 主动推送（threading.Lock 保护，journal 全 run 聚合 + trace 递归打平 nodes/edges）
 - **scope_demo.py（Phase 1 第二批 demo）**：3 项断言（同 key 串行 start>=end / 不同 key 并行总耗时<0.18s / state 写回 first_write=42 跨 acquire 可读）
 - **dashboard_demo.py（Phase 1 第二批 demo）**：后台线程起 dashboard → 3 轮 QuickstartMockLLM calculator mock 跑不同 run_id → 每轮前后 publish() 推送 → 提示用户浏览器打开 http://localhost:8765 → 驻留 10 秒自动退出
+- **三态熔断器（Phase 2.2）**：`atlas.core.CircuitBreakerRegistry` 按 `circuit_key` 管理独立三态状态机（Closed→Open→Half-Open→Closed）；连续失败 N=5 → Open 拒绝请求；冷却窗口 W=30s 后 → Half-Open 放 1 个探测请求（成功→Closed 清零 / 失败→Open 重计时）；`threading.Lock` 线程安全；`allow_request/on_success/on_failure/snapshot` 对外 API；状态变更自动 emit 插件事件（circuit_open/half_open/closed）；Agent 默认自动创建空 Registry（`auto_default_registry=False` 可禁用）
+- **指数退避重试（Phase 2.2）**：`atlas.core.full_jitter_delay_ms(attempt, base=0.1, cap=10)` Full Jitter 算法 `delay=random.uniform(0, min(cap, base*2^attempt))`；仅幂等工具自动重试（`isIdempotent=True`），非幂等工具 `retry_max>0` 注册时直接 ValueError 拒绝（消除 fallback 场景）；默认 `retry_on=(TimeoutError, ConnectionError)`，Tool 注册可覆写；默认 `retry_max=3`（总尝试 = 1 + retry_max）；每次重试 emit retry_before/after 钩子，耗尽 emit retry_exhausted；重试每次失败都计入熔断器失败计数
+- **Tool ABI 增强（Phase 2.2）**：Tool dataclass 新增 `circuit_key`/`retry_on`/`retry_max` 三字段；Toolkit.register() 新增非幂等禁重试约束（`not isIdempotent and retry_max>0` → ValueError）；Agent.run() 工具执行段前置熔断器 `allow_request` 检查 + 包裹重试循环 + 成败计入熔断器
+- **PluginProtocol 扩展 7 钩子（Phase 2.2）**：新增 `on_circuit_open/half_open/closed`（熔断器三态切换）+ `on_retry_before/after/exhausted`（重试前后与耗尽）+ `on_compensate_finish`（补齐 Saga 单步补偿完成）；钩子总数 10 → 17
+- **Dashboard RESILIENCE 横幅（Phase 2.2）**：Dashboard 顶部新增 RESILIENCE 横幅，并排三表：① 熔断器状态表（circuit_key / state / failure_count / open_seconds，OPEN 红 / HALF 黄 / CLOSED 绿）② 最近重试记录表（tool_name / attempt / next_delay_ms / error_type，ring buffer 200 条）③ 活动告警表（Open 超 60s 红色高亮）；DATASTATE 扩 `circuit_breakers`/`retry_logs`/`alerts` 三 key，由 `CircuitBreakerRegistry.snapshot()` 产出
+- **circuit_retry_demo.py（Phase 2.2 demo）**：4 场景断言全可复现——① flaky_api 幂等 retry_max=3 连抛 3 次 RuntimeError 第 4 次成功 ② unreliable_svc 幂等 retry_max=1 永远 TimeoutError → retry_exhausted ③ credit_card_charge 非幂等 retry_max=0 带 compensate 退款 ④ 手动触发熔断器 Open → circuit_rejected 不产生副作用；支持 `--mock --plain` 断言模式与 `--mock --dashboard` 可视模式
 
 ## 技术栈
 
@@ -498,6 +511,12 @@ python examples/scope_demo.py
 python examples/dashboard_demo.py
 # 或单独长期驻留（浏览器刷新即连接，用户代码手动 publish 推送数据）
 python -m atlas dashboard --port 8765
+
+# Phase 2.2：熔断器三态 + 指数退避重试（4 场景断言全可复现）
+# flaky_api 重试成功 / unreliable_svc retry_exhausted / credit_card_charge 非幂等补偿 / 手动熔断 circuit_rejected
+python examples/circuit_retry_demo.py --mock --plain
+# 断言 + 后台起 Dashboard 看 RESILIENCE 横幅三表（熔断器状态/重试记录/告警）
+python examples/circuit_retry_demo.py --mock --dashboard
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -517,9 +536,11 @@ assert ok, reasons
 ```
 Atlas/
 ├── atlas/                  # 核心源码
-│   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿）
-│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；compensate_* 三插件钩子
-│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（10 钩子 no-op 基类；Phase 2.1 新增 on_compensate_start/finish/failed 共 13 钩子）
+│   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿 + 熔断器 + 重试）
+│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环
+│   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（17 钩子 no-op 基类：基础 8 + Saga 3 + 熔断器 3 + 重试 3）
+│   │   ├── circuit_breaker.py # Phase 2.2 新增：CircuitBreakerRegistry 三态状态机（Closed→Open→Half-Open）+ threading.Lock 线程安全 + snapshot 快照
+│   │   ├── retry.py        # Phase 2.2 新增：full_jitter_delay_ms Full Jitter 退避 + sleep_ms
 │   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()（MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector）
 │   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol（@runtime_checkable）+ ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用，Agent 不自评）
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
@@ -541,7 +562,7 @@ Atlas/
 │   ├── llm/                # LLM 接入层：OpenAI 兼容协议
 │   │   └── base.py         # chat() 返回 {message, usage, duration_ms} 三层结构
 │   ├── tools/              # 工具基座与内置工具
-│   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + compensate 字段 + validate_input + parameters_factory）/ Toolkit.register() 升级补偿约束为 ValueError 拒绝
+│   │   ├── base.py         # Tool（含 isReadOnly/isIdempotent/hasSideEffects + compensate + circuit_key/retry_on/retry_max 字段 + validate_input + parameters_factory）/ Toolkit.register() 升级补偿+非幂等禁重试约束为 ValueError 拒绝
 │   │   └── builtin.py      # calculator / get_current_time（均标记 isReadOnly=True）
 │   ├── memory/             # 会话记忆
 │   │   └── base.py         # Phase 1 改造：messages 改 @property + _runtime_messages + project() 五步投影 + token 跟踪 + add_attachment()/add_summary()
@@ -552,7 +573,7 @@ Atlas/
 │   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套 + Trace.meta
 │   ├── cli/                # CLI 子命令
 │   │   ├── init.py         # atlas init：venv + 依赖安装 + .env 配置
-│   │   └── dashboard.py    # Phase 1 第二批：HTTP(8765)+WebSocket(8766) 三面板 Dashboard + publish() 推送 API + HTML 字符串内嵌
+│   │   └── dashboard.py    # Phase 1 第二批 + Phase 2.2 增强：HTTP(8765)+WebSocket(8766) Dashboard + publish() 推送 API + RESILIENCE 横幅三表（熔断器/重试/告警）
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -567,7 +588,8 @@ Atlas/
 │   ├── plugin_cost_demo.py # 插件体系 + 预算护栏：TokenCostPlugin 累计 + CostCap 终止
 │   ├── compact_demo.py     # Phase 1 新增：Compact 机制演示（--mock 第 4 轮 token=8500 触发，5 项断言）
 │   ├── scope_demo.py       # Phase 1 第二批：Scope 演示（同 key 串行 + 不同 key 并行 + state 写回 3 断言）
-│   └── dashboard_demo.py   # Phase 1 第二批：Dashboard 演示（后台起 server + 3 轮 mock quickstart publish）
+│   ├── dashboard_demo.py   # Phase 1 第二批：Dashboard 演示（后台起 server + 3 轮 mock quickstart publish）
+│   └── circuit_retry_demo.py # Phase 2.2 新增：熔断器三态 + 指数退避重试 demo（4 场景断言：flaky 重试成功 / unreliable retry_exhausted / credit_card 非幂等补偿 / 手动熔断 circuit_rejected）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -608,17 +630,25 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 #### 2.1 内核原语（控制平面，必做）
 
 - [x] **Tool ABI 增强（分类标志 + validateInput + compensate 字段）**—— 三标志（`isReadOnly`/`isIdempotent`/`hasSideEffects`，默认全 False）；注册时 `isReadOnly=True` 自动强制幂等，`hasSideEffects+非幂等` **ValueError 直接拒绝注册（无 compensate 不兜底）**；`Tool.validate_input()` 走 `jsonschema`；`parameters_factory` 懒加载闭环；`tool_status` 三态（success / failed / idempotency_hit）
-- [x] **Hook 机制（插件 13 生命周期，原 10 新增 compensate 三钩子）**—— `on_agent_start/finish`、`on_turn_start/finish`、`on_llm_before/after_call`、`on_tool_before/after_call`、`on_compensate_start/finish/failed`；`BasePlugin` no-op 基类，子类按需覆写；配合 `run_id`（UUID）+ `step_id` 全链路可追溯
+- [x] **Hook 机制（插件 17 生命周期钩子）**—— 基础 8（`on_agent_start/finish`、`on_turn_start/finish`、`on_llm_before/after_call`、`on_tool_before/after_call`）+ Saga 3（`on_compensate_start/finish/failed`）+ 熔断器 3（`on_circuit_open/half_open/closed`）+ 重试 3（`on_retry_before/after/exhausted`）；`BasePlugin` no-op 基类，子类按需覆写；配合 `run_id`（UUID）+ `step_id` 全链路可追溯
 - [x] **Role 抽象**（`RoleConfig`：system_prompt + tool_names + temperature/max_steps/timeout_ms 三元组，Python 编程式注入，YAML 声明式由上层 `parallel_subagent_config.yaml` 承载）—— 角色定义不硬编码在内核，由上层注入
 - [x] **`spawn_subagents` 内置工具**（`make_spawn_subagents_tool` 闭包工厂 + `_inject_spawn_tool` 自动注入 + role enum 懒加载 + 嵌套守卫双保险；context 隔离：子 Agent 独立 Memory/Trace；artifact schema 校验：`jsonschema.validate` 不改写原文仅打标记）
 - [x] **`parallel_gather` 原语**（ThreadPoolExecutor 并行 fan-out/gather + enumerate O(1) 顺序保持 + partial success 错误隔离 + 并行效率 meta）—— 持久化/幂等防重留给 Journal 原语
-- [x] **预算护栏（terminator 侧可触发）**—— `CostCap(max_usd)` + `TokenBudget(max_tokens)` 终止条件；`TokenCostPlugin` 累计 `cost_usd` 写入 `_term_ctx`；三态熔断器留后续 Phase 2.2
+- [x] **预算护栏（terminator 侧可触发）**—— `CostCap(max_usd)` + `TokenBudget(max_tokens)` 终止条件；`TokenCostPlugin` 累计 `cost_usd` 写入 `_term_ctx`；三态熔断器已在 Phase 2.2 实现
 - [x] **幂等键 + Saga 补偿注册**—— `atlas.utils.idempotency.derive(run_id, tool_name, input_dict)` SHA-1 40 位派生或 `_idempotency_key` 显式覆盖；Journal 扩 `cache_get/cache_set` 命中跳过真实 func；Agent 无最终答案时 LIFO 反向 compensate 非幂等副作用工具；失败不重试，记录 compensate_failed 插件钩子 + 尾附文字提示人工介入
 - [x] **独立 Evaluator（校验门，不让 Agent 自评）**—— `Evaluator Protocol`（@runtime_checkable）+ 内置 `ArtifactSchemaEvaluator`（JSON Schema 契约 list[(key, schema)]）；顶层 `from atlas import Evaluator, ArtifactSchemaEvaluator`；用户在 agent.run() 之后外部调用
 - [x] **Saga 补偿演示模式**：`examples/saga_demo.py` 一键跑通 write_po→charge→ship(FAIL)→终止→LIFO 补偿→SideEffectTracker.is_empty() 断言（对应 EP-4，100% 可复现，支持 --mock --plain）
-- [ ] **Dashboard 增强**：展示补偿日志、重试状态、告警列表（对应 EP-3）
+- [x] **Dashboard 增强**：顶部 RESILIENCE 横幅三表（熔断器状态/最近重试记录/活动告警），DATASTATE 扩 `circuit_breakers`/`retry_logs`/`alerts`，由 `CircuitBreakerRegistry.snapshot()` 产出（对应 EP-3）
 
-#### 2.2 多 Agent 模式包（上层可选，非内核）
+#### 2.2 内核原语：熔断器 + 重试（控制平面，必做）
+
+- [x] **三态熔断器**—— `CircuitBreakerRegistry` 按 `circuit_key` 管理独立三态状态机（Closed→Open→Half-Open→Closed）；连续失败 N=5 → Open 拒绝请求；冷却窗口 W=30s 后 → Half-Open 放 1 个探测请求（成功→Closed 清零 / 失败→Open 重计时）；`threading.Lock` 线程安全；`allow_request/on_success/on_failure/snapshot` 对外 API；状态变更 emit 插件事件
+- [x] **指数退避重试（Full Jitter）**—— `full_jitter_delay_ms(attempt, base=0.1, cap=10)` = `random.uniform(0, min(cap, base*2^attempt))`；仅幂等工具自动重试，非幂等工具 `retry_max>0` 注册时直接 ValueError 拒绝（消除 fallback）；默认 `retry_on=(TimeoutError, ConnectionError)` 可覆写；默认 `retry_max=3`；重试每次失败计入熔断器失败计数
+- [x] **Tool ABI 扩展**—— Tool dataclass 新增 `circuit_key`/`retry_on`/`retry_max` 三字段；`Toolkit.register()` 新增非幂等禁重试约束；`Agent.run()` 工具执行段前置熔断器检查 + 包裹重试循环
+- [x] **Dashboard Resilience 横幅**—— 顶部三表实时展示熔断器状态（OPEN 红/HALF 黄/CLOSED 绿）、最近重试记录（ring buffer 200 条）、活动告警（Open 超 60s 红色高亮）
+- [x] **circuit_retry_demo.py**—— 4 场景断言全可复现（flaky 重试成功 / unreliable retry_exhausted / credit_card 非幂等补偿 / 手动熔断 circuit_rejected），支持 `--mock --plain` 与 `--mock --dashboard`
+
+#### 2.3 多 Agent 模式包（上层可选，非内核）
 
 模式包定位为"参考实现 + 可直接组装的产品级模式"，位于 `atlas.patterns`（独立于 `atlas.core`）。用户可以不用这些包、只用内核原语自己组装任意模式；也可以引用其中一种作为起点。模式包之间互不依赖，按需引入。
 

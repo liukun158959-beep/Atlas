@@ -22,7 +22,9 @@ from ..memory.base import Memory
 from ..render import PlainRenderer, Renderer
 from ..tools.base import Tool, Toolkit
 from ..utils.idempotency import IDEMPOTENCY_USER_KEY, derive as derive_idempotency_key
+from .circuit_breaker import CircuitBreakerRegistry
 from .plugin import PluginManager
+from .retry import full_jitter_delay_ms, sleep_ms
 from .terminator import CompositeTerminator, Terminator, make_default_terminator
 
 if TYPE_CHECKING:
@@ -53,6 +55,9 @@ class Agent:
         # Phase 1 compact：token 超阈值自动 compact（None 禁用）
         compact_threshold: int | None = 8000,
         transcript: Transcript | None = None,
+        # Phase 2.2：熔断器注册中心（None 时自动创建空 Registry；auto_default_registry=False 时完全禁用熔断器）
+        circuit_breaker_registry: CircuitBreakerRegistry | None = None,
+        auto_default_registry: bool = True,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -61,6 +66,14 @@ class Agent:
         self.terminator: Terminator = terminator or make_default_terminator(max_steps)
         # 插件管理器：None 时用空实例（emit 遍历空列表，无副作用）
         self.plugin_manager: PluginManager = plugin_manager or PluginManager()
+        # 熔断器注册中心：注入后状态变更会自动 emit plugin 事件（通过 set_plugin_manager 懒绑定）
+        self.circuit_breaker_registry: CircuitBreakerRegistry | None = (
+            circuit_breaker_registry
+            or (CircuitBreakerRegistry() if auto_default_registry else None)
+        )
+        if self.circuit_breaker_registry is not None:
+            # 懒绑定：熔断器状态变更时通过 PluginManager 分发事件
+            self.circuit_breaker_registry.set_plugin_manager(self.plugin_manager)
         # Journal：None 时不记录事件
         self.journal: JournalProtocol | None = journal
         # 渲染器：默认 PlainRenderer（纯文本），注入 RichRenderer 后支持 Markdown
@@ -108,6 +121,7 @@ class Agent:
             name=name,
             description=desc,
             parameters=params_factory(),   # 首次注册用静态占位
+            retry_max=0,  # spawn_subagents 非幂等（创建子 Agent 有副作用），禁止自动重试
         )
         # Q19 懒加载：后续每轮 to_openai_tools 调用重新读取 role_configs enum
         tool.parameters_factory = params_factory
@@ -194,6 +208,14 @@ class Agent:
                         sid, tname, comp_func, ci = _saga_stack.pop()
                         try:
                             comp_func(ci, last_result, {"run_id": run_id, "step_id": sid, "tool_name": tname})
+                            # Step 2 钩子补齐：Phase 2.1 Saga 已写 Journal，现在补 plugin emit
+                            self.plugin_manager.emit(
+                                "compensate_finish",
+                                run_id=run_id,
+                                step_id=sid,
+                                tool_name=tname,
+                                status="success",
+                            )
                             self._journal_append(
                                 run_id, "compensate_finish",
                                 {"step_id": sid, "tool_name": tname, "status": "success"},
@@ -372,22 +394,136 @@ class Agent:
                     result = cached_result
                     tool_status = "idempotency_hit"
                 else:
-                    # Step 4: 真正执行（原有 try/except 逻辑不变）
-                    tool_start = time.time()
-                    try:
-                        # 注意：execute 内部重新 json.loads(arguments)，所以传原始 fn["arguments"]
-                        # 但我们已经 pop 掉了 _idempotency_key → 重新序列化一份去掉魔法字段的 arguments
-                        cleaned_args = tool_input if not isinstance(fn["arguments"], str) else json.dumps(tool_input, ensure_ascii=False)
-                        result = self.tools.execute(tool_name, cleaned_args)
-                        tool_status = "success"
-                    except Exception as e:
-                        result = f"工具执行失败: {e}"
-                        tool_status = "failed"
-                    tool_duration_ms = int((time.time() - tool_start) * 1000)
+                    # -------- Phase 2.2 NEW: 熔断器前置检查（幂等 miss 才需要真执行） --------
+                    circuit_key = tool.circuit_key or tool_name
+                    circuit_registry = self.circuit_breaker_registry
+                    allowed, _circuit_state_after, circuit_reason_msg = True, None, None
+                    if circuit_registry is not None:
+                        allowed, _circuit_state_after, circuit_reason_msg = circuit_registry.allow_request(
+                            circuit_key, run_id=run_id
+                        )
 
-                    # 执行成功才写幂等 cache（失败不写，下次能重试）
-                    if self.journal and tool_status == "success":
-                        self.journal.cache_set(key, result)
+                    if not allowed:
+                        # 熔断器拒绝 → 直接构造失败，不执行、不 cache、不入 saga、不重试
+                        result = f"工具执行被熔断器拒绝: {circuit_reason_msg or 'circuit open'}"
+                        tool_status = "circuit_rejected"
+                        tool_duration_ms = 0
+                    else:
+                        # -------- Phase 2.2 NEW: 熔断器放行 → 用重试循环包裹真正执行 --------
+                        tool_start = time.time()
+                        result = None
+                        last_error: Exception | None = None
+                        actual_retry_max = tool.retry_max if tool.isIdempotent else 0
+                        total_attempts = actual_retry_max + 1
+
+                        for attempt_idx in range(total_attempts):
+                            try:
+                                # Step 4 真正执行（保持原 cleaned_args 逻辑）
+                                cleaned_args = (
+                                    tool_input
+                                    if not isinstance(fn["arguments"], str)
+                                    else json.dumps(tool_input, ensure_ascii=False)
+                                )
+                                result = self.tools.execute(tool_name, cleaned_args)
+                                tool_status = "success"
+                                last_error = None
+                                # 熔断器 on_success（每次执行成功都计，包括重试成功）
+                                if circuit_registry is not None:
+                                    circuit_registry.on_success(circuit_key, run_id=run_id)
+                                break  # 成功跳出重试循环
+                            except Exception as e:
+                                last_error = e
+                                # 熔断器 on_failure（每次失败都计，包括重试的每一次）
+                                if circuit_registry is not None:
+                                    circuit_registry.on_failure(circuit_key, run_id=run_id)
+
+                                # 判断能否继续重试：幂等 + 异常在 retry_on 白名单 + 不是最后一轮
+                                is_retryable = (
+                                    tool.isIdempotent
+                                    and any(isinstance(e, et) for et in tool.retry_on)
+                                    and attempt_idx < actual_retry_max
+                                )
+                                if not is_retryable:
+                                    result = f"工具执行失败: {e}"
+                                    tool_status = "failed"
+                                    # 重试耗尽？（幂等且 actual_retry_max>0 且跑到了最后一轮）
+                                    if (
+                                        tool.isIdempotent
+                                        and actual_retry_max > 0
+                                        and attempt_idx >= actual_retry_max
+                                    ):
+                                        self._emit_and_journal(
+                                            run_id, "retry_exhausted",
+                                            payload={
+                                                "turn_idx": step_no,
+                                                "step_id": step_id,
+                                                "tool_name": tool_name,
+                                                "total_attempts": total_attempts,
+                                                "last_error": str(e),
+                                            },
+                                            turn_idx=step_no,
+                                            step_id=step_id,
+                                            tool_name=tool_name,
+                                            total_attempts=total_attempts,
+                                            last_error=str(e),
+                                        )
+                                    break  # 不能重试 → 跳出循环
+
+                                # 可以重试 → retry_before → sleep → retry_after
+                                attempt_no = attempt_idx + 1  # 给用户看的"第几次重试"，从1开始
+                                delay_ms = full_jitter_delay_ms(attempt_no)
+                                self._emit_and_journal(
+                                    run_id, "retry_before",
+                                    payload={
+                                        "turn_idx": step_no,
+                                        "step_id": step_id,
+                                        "tool_name": tool_name,
+                                        "attempt": attempt_no,
+                                        "next_delay_ms": delay_ms,
+                                        "error_type": type(e).__name__,
+                                        "error": str(e),
+                                    },
+                                    turn_idx=step_no,
+                                    step_id=step_id,
+                                    tool_name=tool_name,
+                                    attempt=attempt_no,
+                                    next_delay_ms=delay_ms,
+                                    error_type=type(e).__name__,
+                                )
+                                # 写入熔断器 registry 的 retry_logs（Dashboard 展示用）
+                                if circuit_registry is not None:
+                                    circuit_registry.append_retry_log({
+                                        "ts": time.time(),
+                                        "run_id": run_id,
+                                        "step_id": step_id,
+                                        "tool_name": tool_name,
+                                        "attempt": attempt_no,
+                                        "next_delay_ms": delay_ms,
+                                        "error_type": type(e).__name__,
+                                    })
+                                sleep_ms(delay_ms)
+                                self._emit_and_journal(
+                                    run_id, "retry_after",
+                                    payload={
+                                        "turn_idx": step_no,
+                                        "step_id": step_id,
+                                        "tool_name": tool_name,
+                                        "attempt": attempt_no,
+                                        "status": "failed",
+                                    },
+                                    turn_idx=step_no,
+                                    step_id=step_id,
+                                    tool_name=tool_name,
+                                    attempt=attempt_no,
+                                    status="failed",
+                                )
+                                # 进入下一轮 for 循环 = 下一次重试
+
+                        tool_duration_ms = int((time.time() - tool_start) * 1000)
+
+                        # 执行成功才写幂等 cache（失败/重试耗尽/熔断器拒绝都不写）
+                        if self.journal and tool_status == "success":
+                            self.journal.cache_set(key, result)
 
                 # Step 5: 进 saga_stack：非幂等有副作用 且 有 compensate 且 真正执行成功时
                 if (

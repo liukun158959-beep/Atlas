@@ -129,8 +129,8 @@ def main() -> None:
             journal=journal,
         )
 
-        # 开始前 publish 一次（空 trace + 初步 run 状态）
-        publish(run_id, journal, agent.trace)
+        # 开始前 publish 一次（空 trace + 初步 run 状态 + resilience 空快照）
+        publish(run_id, journal, agent.trace, agent.circuit_breaker_registry)
         print(f"[{run_id}] running: {prompt}")
 
         try:
@@ -140,7 +140,7 @@ def main() -> None:
             print(f"[{run_id}] FAILED : {exc}")
 
         # 跑完再 publish 一次
-        publish(run_id, journal, agent.trace)
+        publish(run_id, journal, agent.trace, agent.circuit_breaker_registry)
         time.sleep(1.2)  # 给浏览器看 DAG 切换的视觉效果
 
     print()

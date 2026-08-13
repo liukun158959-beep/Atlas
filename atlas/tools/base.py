@@ -34,6 +34,15 @@ class Tool:
     返回值: 不做要求，内核只关心是否抛异常。返回非 None 的带 error 键 dict 视为业务失败。
     """
 
+    circuit_key: str | None = None
+    """熔断器隔离键。None 时运行时 fallback 为 tool_name。不同工具共享相同 circuit_key 可共用一个熔断器（如同一外部服务的多个接口）。"""
+
+    retry_on: tuple[type[Exception], ...] = (TimeoutError, ConnectionError)
+    """触发自动重试的异常白名单。空 tuple = 永不重试（即便 retry_max>0 也不重试）。仅当 isIdempotent=True 时生效，非幂等工具 retry_max>0 会在注册时被拒绝。"""
+
+    retry_max: int = 3
+    """最大重试次数。0 = 永不重试（总尝试次数 = 1 次原执行 + retry_max 次重试）。"""
+
     def validate_input(self, input: dict) -> None:
         """用 JSON Schema 校验输入参数，校验失败抛 jsonschema.ValidationError。"""
         schema = self.parameters
@@ -59,12 +68,16 @@ class Toolkit:
         isIdempotent: bool = False,
         hasSideEffects: bool = False,
         compensate: Callable[[dict, Any, dict], dict] | None = None,
+        circuit_key: str | None = None,
+        retry_on: tuple[type[Exception], ...] = (TimeoutError, ConnectionError),
+        retry_max: int = 3,
     ) -> Tool:
         """注册一个工具，重名时直接报错（消除命名冲突的模糊性）。
 
         三分类标志约束：
         - isReadOnly=True 自动强制 isIdempotent=True（纯查询天然幂等）
         - hasSideEffects=True 且 isIdempotent=False 必须注册 compensate()，否则 ValueError 拒绝
+        - 非幂等工具禁止自动重试（retry_max 必须=0），否则 ValueError 拒绝
         """
         if name in self._tools:
             raise ValueError(f"工具已存在: {name}")
@@ -76,6 +89,11 @@ class Toolkit:
             raise ValueError(
                 f"Tool {name}: hasSideEffects=True 且非幂等，必须注册 compensate() 函数"
             )
+        # 非幂等工具禁止自动重试（从源头消除 fallback 触发场景）
+        if not isIdempotent and retry_max > 0:
+            raise ValueError(
+                f"Tool {name}: 非幂等工具禁止重试（retry_max 必须=0，请在调用处手动处理失败）"
+            )
         tool = Tool(
             name=name,
             description=description,
@@ -85,6 +103,9 @@ class Toolkit:
             isIdempotent=isIdempotent,
             hasSideEffects=hasSideEffects,
             compensate=compensate,
+            circuit_key=circuit_key,
+            retry_on=retry_on,
+            retry_max=retry_max,
         )
         self._tools[name] = tool
         return tool

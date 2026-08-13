@@ -26,10 +26,15 @@ class PluginProtocol(Protocol):
             llm_before_call
             llm_after_call
             tool_before_call（如有工具调用）
+              circuit_half_open / circuit_open（熔断器状态切换时）
+              retry_before → sleep → retry_after（每次重试前后）
+              retry_exhausted（重试耗尽时）
             tool_after_call
           turn_finish
           compensate_start（如有补偿触发）
-          compensate_failed（如补偿失败）
+          compensate_finish（单次补偿成功时）
+          compensate_failed（单次补偿失败时）
+          circuit_closed（熔断器恢复时）
         agent_finish
     """
 
@@ -170,6 +175,95 @@ class PluginProtocol(Protocol):
         """某次补偿动作失败（严重，需要人工）。"""
         ...
 
+    def on_compensate_finish(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        tool_name: str,
+        status: str,
+    ) -> None:
+        """某次补偿动作成功结束。"""
+        ...
+
+    # ------------------------------------------------------------------
+    # 熔断器 Resilience
+    # ------------------------------------------------------------------
+
+    def on_circuit_open(
+        self,
+        *,
+        run_id: str | None,
+        circuit_key: str,
+        failure_count: int,
+        open_window_seconds: int,
+    ) -> None:
+        """熔断器 Closed→Open（连续失败达到阈值）。"""
+        ...
+
+    def on_circuit_half_open(
+        self,
+        *,
+        run_id: str | None,
+        circuit_key: str,
+    ) -> None:
+        """熔断器 Open→Half-Open（冷却结束，开始放探测请求）。"""
+        ...
+
+    def on_circuit_closed(
+        self,
+        *,
+        run_id: str | None,
+        circuit_key: str,
+        probe_success: bool,
+    ) -> None:
+        """熔断器 Half-Open→Closed（探测成功恢复）。"""
+        ...
+
+    # ------------------------------------------------------------------
+    # 重试 Resilience
+    # ------------------------------------------------------------------
+
+    def on_retry_before(
+        self,
+        *,
+        run_id: str,
+        turn_idx: int,
+        step_id: str,
+        tool_name: str,
+        attempt: int,
+        next_delay_ms: int,
+        error_type: str,
+    ) -> None:
+        """某次重试 sleep 之前。attempt 从 1 开始计数。"""
+        ...
+
+    def on_retry_after(
+        self,
+        *,
+        run_id: str,
+        turn_idx: int,
+        step_id: str,
+        tool_name: str,
+        attempt: int,
+        status: str,
+    ) -> None:
+        """某次重试 sleep 之后（结果已知前 / 后，用于统计）。"""
+        ...
+
+    def on_retry_exhausted(
+        self,
+        *,
+        run_id: str,
+        turn_idx: int,
+        step_id: str,
+        tool_name: str,
+        total_attempts: int,
+        last_error: str,
+    ) -> None:
+        """所有重试耗尽，工具最终标记失败之前。"""
+        ...
+
 
 # ----------------------------------------------------------------------
 # 基类：实现所有钩子为 no-op，子类按需覆写
@@ -225,6 +319,27 @@ class BasePlugin:
         pass
 
     def on_compensate_failed(self, *, run_id: str, step_id: str, tool_name: str, error: str, retry_count: int, next_retry_at: str | None) -> None:
+        pass
+
+    def on_compensate_finish(self, *, run_id: str, step_id: str, tool_name: str, status: str) -> None:
+        pass
+
+    def on_circuit_open(self, *, run_id: str | None, circuit_key: str, failure_count: int, open_window_seconds: int) -> None:
+        pass
+
+    def on_circuit_half_open(self, *, run_id: str | None, circuit_key: str) -> None:
+        pass
+
+    def on_circuit_closed(self, *, run_id: str | None, circuit_key: str, probe_success: bool) -> None:
+        pass
+
+    def on_retry_before(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, attempt: int, next_delay_ms: int, error_type: str) -> None:
+        pass
+
+    def on_retry_after(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, attempt: int, status: str) -> None:
+        pass
+
+    def on_retry_exhausted(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, total_attempts: int, last_error: str) -> None:
         pass
 
 
