@@ -58,6 +58,9 @@ class Agent:
         # Phase 2.2：熔断器注册中心（None 时自动创建空 Registry；auto_default_registry=False 时完全禁用熔断器）
         circuit_breaker_registry: CircuitBreakerRegistry | None = None,
         auto_default_registry: bool = True,
+        # Phase 4.1：RSI 自进化基础设施（None 时 inspect_self 返回空 list，零侵入）
+        skill_library: Any | None = None,
+        failure_memory: Any | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -99,6 +102,14 @@ class Agent:
         if self.role_configs and self.auto_inject_spawn_tool:
             self._inject_spawn_tool()
 
+        # Phase 4.1：RSI 自进化基础设施引用
+        self.skill_library = skill_library
+        self.failure_memory = failure_memory
+        # 遍历已注册插件，对有 bind_agent 方法的自动注入 Agent 弱引用
+        for plugin in self.plugin_manager.plugins:
+            if hasattr(plugin, "bind_agent"):
+                plugin.bind_agent(self)
+
     # ------------------------------------------------------------------
     # spawn_subagents 工具注入（Step 2.2 一次性写完，含优化）
     # ------------------------------------------------------------------
@@ -132,6 +143,19 @@ class Agent:
         self.role_configs[config.name] = config
         if was_empty and self.role_configs and self.auto_inject_spawn_tool:
             self._inject_spawn_tool()
+
+    # ------------------------------------------------------------------
+    # Phase 4.1：RSI 自省
+    # ------------------------------------------------------------------
+
+    def inspect_self(self) -> Any:
+        """读取自身状态做自进化决策，返回 SelfSnapshot。
+
+        委托给 atlas.rsi.build_self_snapshot()，Agent 只做委托。
+        skill_library/failure_memory 为 None 时对应字段返回空 list（零侵入）。
+        """
+        from ..rsi.inspector import build_self_snapshot
+        return build_self_snapshot(self)
 
     def _journal_append(self, run_id: str, event_type: str, payload: dict) -> None:
         """便捷方法：向 Journal 追加事件（若 journal 未注入则跳过）。"""

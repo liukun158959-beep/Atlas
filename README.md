@@ -395,6 +395,12 @@ log.warning("saga.compensate.complete",
 - **PluginProtocol 扩展 2 钩子（Phase 3.2）**：新增 `on_suspend(run_id, node_name, prompt, token_dict)` + `on_resume(run_id, node_name, user_input, resumed_from_seq)`；钩子总数 17 → 19；可用于插件在挂起时暂停计时、恢复时恢复计时或外部系统通知
 - **GraphResult 三新字段（Phase 3.2）**：`status`（"completed"/"suspended"，默认"completed"—— Phase 3.1 老代码零成本忽略）、`suspend_prompt`（status=suspended 时的提示文本）、`suspend_token`（`SuspendToken` 对象或 None）；`GraphTrace.terminated_by` 新增允许值 "suspended"
 - **suspend_resume_demo.py（Phase 3.2 demo）**：7 项断言全可复现——① 挂起态 status+suspended_prompt 含订单/金额/商品 ② approved=True→shipped+SHIP-PO-999 ③ state 保留（order_id/amount/submitted）+ resume 注入（approved=True）④ approved=False→cancelled+拒绝理由 ⑤ Journal 事件链 ≥4 条（三种类型齐全）⑥ 双 Graph 实例崩溃恢复（del graph1→新建 graph2 同结构同 Journal→resume，结果和单实例 approved=True 100% 一致）⑦ `graph_resume.payload.resumed_from_seq == graph_suspend.seq`（审计链路一致）
+- **EmbeddingProtocol + FakeEmbedding / OpenAIEmbedding（Phase 4.1）**：`atlas.rsi.EmbeddingProtocol`（embed / embed_batch / dimension 三方法）；`FakeEmbedding` MD5 hash → 64 维归一化向量（跨进程确定性，demo 100% 可复现）；`OpenAIEmbedding` 复用 LLM 的 OpenAI 兼容 client（默认 text-embedding-3-small 1536 维），同 base_url / api_key
+- **VectorStoreProtocol + SQLiteVectorStore（Phase 4.1）**：`atlas.rsi.VectorStoreProtocol`（add / query / get / delete / count 五方法）+ `VectorHit(id, score, metadata)`；默认实现 `SQLiteVectorStore`：embedding 序列化 bytes 存 SQLite，检索时纯 Python 余弦相似度 top-k（零外部依赖，不引入 Chroma）；threading.Lock 线程安全
+- **Skill Library（Phase 4.1）**：`atlas.rsi.SkillLibrary` 代码即数据的技能注册/检索/版本化——`Skill(name, description, code, embedding, version, fitness_score)` dataclass 独立于 Tool；`register()` 自动 embed(description) + 同 name 版本递增；`retrieve(query)` 语义检索 top-k；`to_tool()` exec(code) → 提取同名函数 → 包装成 Tool（打通 SkillLibrary 和 Toolkit）；4.1 不做 Critic 入库闸门（留给 4.2）
+- **失败记忆 FailureMemory + Collector（Phase 4.1）**：`atlas.rsi.FailureMemory` 记录/语义检索/最近列表——`FailureCase(run_id, step_id, tool_name, input_summary, error_message, error_type, context_summary, embedding)` dataclass；`FailureMemoryCollector(BasePlugin)` 挂 `on_tool_after_call(failed)` / `on_retry_exhausted` / `on_compensate_failed` 三钩子实时采集；通过 `bind_agent(agent)` 注入 Agent 弱引用（weakref），从 `agent.memory.messages` 读取 system_prompt + user_input 构造 context_summary；Agent `__init__` 末尾遍历 plugins 自动 `hasattr(bind_agent)` 注入
+- **inspect_self() 自省（Phase 4.1）**：`Agent.inspect_self() -> SelfSnapshot`——Agent 方法委托 `atlas.rsi.build_self_snapshot()`；`SelfSnapshot` 5 字段：system_prompt / tool_definitions / skill_summaries / recent_failures / memory_summary；Agent 构造函数新增 `skill_library` + `failure_memory` 两个可选参数（None 默认，零侵入——现有 demo 无需改动）
+- **rsi_demo.py（Phase 4.1 demo）**：8 项断言全可复现——① SkillLibrary register + retrieve ② 版本化（同 name v1→v2）③ to_tool()（exec code → Tool.func）④ FailureMemory record + retrieve ⑤ Collector Plugin 自动采集（on_tool_after_call failed → FailureMemory）⑥ inspect_self()（SelfSnapshot 5 字段非空）⑦ 空值零侵入（skill_library=None + failure_memory=None → 空 list）⑧ FakeEmbedding 确定性（相同文本相同向量，dim=64）
 
 ## 技术栈
 
@@ -566,6 +572,10 @@ python examples/parallel_edge_demo.py --plain
 #               -> (条件边: approved ? ship_order : cancel_order) -> END
 # 包含双 Graph 实例崩溃恢复断言：del graph -> 新建 graph(同结构+同Journal) -> resume 成功
 python examples/suspend_resume_demo.py --plain
+
+# Phase 4.1：RSI 自进化基础设施（Skill Library + 失败记忆 + inspect_self，8 项断言全可复现）
+# SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self
+python examples/rsi_demo.py --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -586,7 +596,7 @@ assert ok, reasons
 Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿 + 熔断器 + 重试）
-│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环
+│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环；Phase 4.1 skill_library/failure_memory 参数 + inspect_self() + bind_agent 自动注入
 │   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（19 钩子 no-op 基类：基础 8 + Saga 3 + 熔断器 3 + 重试 3 + HITL 2 on_suspend/on_resume）
 │   │   ├── circuit_breaker.py # Phase 2.2 新增：CircuitBreakerRegistry 三态状态机（Closed→Open→Half-Open）+ threading.Lock 线程安全 + snapshot 快照
 │   │   ├── retry.py        # Phase 2.2 新增：full_jitter_delay_ms Full Jitter 退避 + sleep_ms
@@ -631,6 +641,13 @@ Atlas/
 │   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
 │   │   ├── planner_worker_critic.py # Phase 2.3 PlannerWorkerCritic 主实现 + 5 dataclass + 3 角色 prompt + _parse_plan/_parse_critic
 │   │   └── orchestrator_workers.py  # Phase 2.4 OrchestratorWorkers 主实现 + 4 dataclass + 2 角色 prompt + _parse_orchestrator_json
+│   ├── rsi/                # Phase 4.1 新增：RSI 自进化基础设施（独立于 core，和 patterns 同级）
+│   │   ├── __init__.py     # re-export SkillLibrary/Skill/FailureMemory/FailureCase/FailureMemoryCollector/SelfSnapshot/FakeEmbedding/OpenAIEmbedding/SQLiteVectorStore/VectorStoreProtocol/EmbeddingProtocol
+│   │   ├── embedding.py    # EmbeddingProtocol（embed/embed_batch/dimension）+ FakeEmbedding（MD5 hash 64 维确定性）+ OpenAIEmbedding（复用 LLM client）
+│   │   ├── vector_store.py # VectorStoreProtocol（add/query/get/delete/count）+ VectorHit + SQLiteVectorStore（bytes 存 SQLite + 纯 Python 余弦相似度）
+│   │   ├── skill.py        # Skill dataclass（name/description/code/embedding/version/fitness_score）+ SkillLibrary（register/retrieve/get/list_all/latest_version）+ to_tool()
+│   │   ├── failure.py      # FailureCase dataclass + FailureMemory（record/retrieve/list_recent）+ FailureMemoryCollector(BasePlugin)（挂 3 钩子 + weakref 读 Agent 上下文）
+│   │   └── inspector.py    # SelfSnapshot dataclass（5 字段）+ build_self_snapshot(agent)
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -651,6 +668,7 @@ Atlas/
 │   ├── edge_demo.py          # Phase 3.1 新增：Edge 控制流边 demo（条件分支 + 循环 + state 传递，5 项断言：节点顺序/边路由/最终答案/terminated_by/state 传递）
 │   ├── parallel_edge_demo.py # Phase 3.1 新增：Parallel 并行汇聚 demo（ParallelNode 扇出 + and_ 汇聚，4 项断言：并行执行/结果长度/汇总内容/耗时）
 │   └── suspend_resume_demo.py# Phase 3.2 新增：Suspend/Resume Durable HITL demo（7 项断言：挂起态字段/approved→发货/state保留+注入/reject→取消/Journal事件链/崩溃恢复双实例/resumed_from_seq一致）
+│   ├── rsi_demo.py          # Phase 4.1 新增：RSI 自进化基础设施 demo（8 项断言：SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self 空值零侵入 + FakeEmbedding 确定性）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -766,9 +784,19 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 
 **实现参考**：Skill Library 参考 **Voyager**（Chroma 向量检索 + trace-extracted 入库闸门）；Prompt 进化参考 **GEPA**（反思式变异 + Pareto 选择）和 **prompt-evolver**（leakage guardrails）；安全分层参考 **OpenHands**（Confirmation Policy + Risk Analyzer + Docker 沙箱）。
 
-- [ ] Skill Library（注册/检索/版本化，三件套：代码+描述+embedding）—— Critic 判定成功才入库，劣质技能不进库
-- [ ] 失败记忆（失败案例 > 成功案例，embedding 检索）—— 对比反思式一次性再生
-- [ ] `inspect_self()` + `propose_diff()` + `evaluate()` + `archive`（上下文层范围：prompt/skill，不改架构）
+#### Phase 4.1：感知 + 记忆层（已完成）
+
+- [x] **EmbeddingProtocol + FakeEmbedding / OpenAIEmbedding**—— `atlas.rsi.EmbeddingProtocol`（embed / embed_batch / dimension）；FakeEmbedding MD5 hash → 64 维确定性向量（demo 可复现）；OpenAIEmbedding 复用 LLM client（text-embedding-3-small 1536 维）
+- [x] **VectorStoreProtocol + SQLiteVectorStore**—— 可插拔向量存储协议（add/query/get/delete/count）+ VectorHit(id, score, metadata)；默认 SQLiteVectorStore：bytes 存 SQLite + 纯 Python 余弦相似度 top-k（零外部依赖，不引入 Chroma）；threading.Lock 线程安全
+- [x] **Skill Library**—— `Skill(name, description, code, embedding, version, fitness_score)` dataclass 独立于 Tool；`SkillLibrary` register（自动 embed + 版本递增）/ retrieve（语义检索 top-k）/ get / list_all / latest_version；`to_tool()` exec(code) → Tool（打通 SkillLibrary 和 Toolkit）；4.1 不做 Critic 入库闸门
+- [x] **失败记忆**—— `FailureCase` dataclass + `FailureMemory`（record/retrieve/list_recent）+ `FailureMemoryCollector(BasePlugin)` 挂 on_tool_after_call(failed)/on_retry_exhausted/on_compensate_failed 三钩子实时采集；weakref 读 Agent 上下文构造 context_summary；Agent __init__ 自动 bind_agent 注入
+- [x] **inspect_self()**—— `Agent.inspect_self() -> SelfSnapshot`（system_prompt / tool_definitions / skill_summaries / recent_failures / memory_summary）；Agent 新增 skill_library + failure_memory 可选参数（None 默认，零侵入）
+- [x] **rsi_demo.py**—— 8 项断言全可复现：SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self 空值零侵入 + FakeEmbedding 确定性
+- [x] **V1 单步 + V2 demo 8 项 + V3 全回归**（13 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume）
+
+#### Phase 4.2：修改 + 验证层（待实施）
+
+- [ ] `propose_diff()` + `evaluate()` + `archive`（上下文层范围：prompt/skill，不改架构）—— Critic 判定成功才入库，劣质技能不进库
 - [ ] 分层权限模型（核心层只读 / 缓冲层受控 / 自由层沙箱）—— 高风险动作要求人类确认
 - [ ] Prompt 进化（GEPA 式反思遗传 + leakage guardrails）
 
