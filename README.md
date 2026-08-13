@@ -406,7 +406,7 @@ log.warning("saga.compensate.complete",
 - **ArchiveStore 提案归档（Phase 4.2a）**：`atlas.rsi.ArchiveStore` 归档所有提案（通过 + 未通过）——`ArchivedProposal(proposal, evaluation, archived_at)`；`list_failed()` 返回失败提案，下次 `propose_diff` 时摘要注入 prompt 避免重复提议；Agent 构造函数新增 `archive_store` 可选参数（None 默认，零侵入）
 - **Agent 自进化方法（Phase 4.2a）**：`Agent.propose_diff()` + `Agent.self_evolve()` 委托 `atlas.rsi`（和 inspect_self 一致模式）；FakeLLM 5 次调用序列精确映射（成功闭环 #1-2 + 失败闭环 #3 不调 LLM + archive 反馈 #4-5）
 - **rsi_evolution_demo.py（Phase 4.2a demo）**：7 项断言全可复现——① propose_diff 返回 ProposedDiff ② check_permission 权限校验（skill=BUFFERED / graph=CORE）③ evaluate 测试通过（exec + 同名函数存在）④ evaluate 测试拒绝（语法错误不调 LLM，_step 不变）⑤ Critic 通过（passed=true/score=0.85）⑥ apply 版本递增（v1→v2 + 新 skill 可执行）⑦ archive 失败反馈（失败提案归档后下次 propose prompt 含归档摘要）
-- **Prompt 进化 · 反思式变异（Phase 4.2b）**：`atlas.rsi.FitnessEvaluator` Protocol（`evaluate(prompt) -> FitnessResult(score, feedback, task_results)`）+ `FakeFitnessEvaluator`（确定性序列 0.4/0.8/0.3，demo 100% 可复现）+ `TaskSetFitnessEvaluator`（真实接口预留，跑任务集 + Evaluator 打分）；单 lineage 反思式变异——`_extract_fitness_history` 从 `ArchiveStore.list_recent()` 提取适应度轨迹格式化为"第 N 代 score=X feedback=Y"注入下一代 propose prompt（反思依据）+ `_extract_archived_failures` 注入失败摘要避免重复提议
+- **Prompt 进化 · 反思式变异（Phase 4.2b）**：`atlas.rsi.FitnessEvaluator` Protocol（`evaluate(prompt) -> FitnessResult(score, feedback, task_results)`）+ `FakeFitnessEvaluator`（确定性序列 0.4/0.8/0.3，demo 100% 可复现）+ `TaskSetFitnessEvaluator`（真实适应度评估：跑任务集 + Schema/关键字打分，复用 `_validate_artifact_schema`，agent_factory 注入构造临时 Agent）；单 lineage 反思式变异——`_extract_fitness_history` 从 `ArchiveStore.list_recent()` 提取适应度轨迹格式化为"第 N 代 score=X feedback=Y"注入下一代 propose prompt（反思依据）+ `_extract_archived_failures` 注入失败摘要避免重复提议
 - **Leakage Guardrails（Phase 4.2b）**：`atlas.rsi.LeakageGuard` Protocol（`check(prompt) -> LeakageCheckResult(passed, matched_patterns)`）+ `RegexLeakageGuard`（内置默认 ~10 个中英文越狱模式 ignore previous/忽略以上/you are now/你现在是/system override/jailbreak/DAN/忽略所有规则/disregard above/new instructions + `extra_patterns` 可追加，预编译正则忽略大小写）；在 fitness 通过后、apply 前执行，命中即 archive 为 failed（EvaluationResult(passed=False, feedback="leakage detected: [matched]")）
 - **Agent Prompt 进化方法（Phase 4.2b）**：`Agent.evolve_prompt() -> EvolutionResult` 委托 `atlas.rsi.evolve_prompt()`（和 self_evolve 并列，内部复用 4.2a apply_diff system_prompt 分支）；`EvolutionResult(generation, proposal, evaluation, leakage_check, applied)` 携带完整进化轨迹；Agent 构造函数新增 `fitness_evaluator` + `leakage_guard` 可选参数 + `generation: int = 0` 计数器（apply 成功后 +1，零侵入）
 - **prompt_evolution_demo.py（Phase 4.2b demo）**：8 项断言全可复现——① 返回 EvolutionResult ② fitness score ∈ [0,1] ③ 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）④ LeakageGuard 拦截越狱 ⑤ apply 后 system_prompt 替换（generation 0→1）⑥ archive 记录通过+失败 ⑦ 多代进化（gen2 fitness 0.8 > gen1 0.4）⑧ RegexLeakageGuard 正则黑名单命中（matched_patterns 非空）
@@ -593,6 +593,10 @@ python examples/rsi_evolution_demo.py --plain
 # Phase 4.2b：Prompt 进化（反思式变异 + 适应度 + Leakage Guardrails，8 项断言全可复现）
 # 单 lineage 反思式变异 + FakeFitnessEvaluator 0.4→0.8 适应度上升 + RegexLeakageGuard 拦截越狱
 python examples/prompt_evolution_demo.py --plain
+
+# TaskSetFitnessEvaluator：真实适应度评估（跑任务集 + Schema/关键字打分，6 项断言全可复现）
+# FakeLLM 根据 prompt 质量返回不同答案 → 低质量 prompt score=0.0 / 高质量 prompt score=1.0
+python examples/taskset_fitness_demo.py --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -691,7 +695,8 @@ Atlas/
 │   ├── suspend_resume_demo.py# Phase 3.2 新增：Suspend/Resume Durable HITL demo（7 项断言：挂起态字段/approved→发货/state保留+注入/reject→取消/Journal事件链/崩溃恢复双实例/resumed_from_seq一致）
 │   ├── rsi_demo.py          # Phase 4.1 新增：RSI 自进化基础设施 demo（8 项断言：SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self 空值零侵入 + FakeEmbedding 确定性）
 │   ├── rsi_evolution_demo.py# Phase 4.2a 新增：RSI 自进化闭环 demo（7 项断言：propose_diff + 权限校验 + 测试通过 + 测试拒绝不调 LLM + Critic 通过 + apply 版本递增 + archive 失败反馈）
-│   └── prompt_evolution_demo.py # Phase 4.2b 新增：Prompt 进化 demo（8 项断言：EvolutionResult + fitness score + 反思式变异 + Leakage 拦截 + apply 替换 + archive 通过+失败 + 多代 fitness 上升 + 正则黑名单命中）
+│   ├── prompt_evolution_demo.py # Phase 4.2b 新增：Prompt 进化 demo（8 项断言：EvolutionResult + fitness score + 反思式变异 + Leakage 拦截 + apply 替换 + archive 通过+失败 + 多代 fitness 上升 + 正则黑名单命中）
+│   └── taskset_fitness_demo.py # TaskSetFitnessEvaluator demo（6 项断言：FitnessResult + score ∈ [0,1] + task_results 长度 + 低质 prompt 0.0 + 高质 prompt 1.0 + feedback 详情）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖

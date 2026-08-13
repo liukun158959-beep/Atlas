@@ -6,7 +6,7 @@ Q9=B：evaluate(prompt) -> FitnessResult(score, feedback, task_results)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass
@@ -64,31 +64,88 @@ class FakeFitnessEvaluator:
 
 
 class TaskSetFitnessEvaluator:
-    """真实适应度评估器：在任务集上跑 Agent + Evaluator 打分。
+    """真实适应度评估器：在任务集上跑 Agent + Schema/关键字打分。
 
-    4.2b 只留骨架（真实使用用户自行实现 evaluate 逻辑）。
-    需要注入：task_set（测试任务列表）+ evaluator（ArtifactSchemaEvaluator 或自定义）+ agent_factory（构造测试 Agent）。
+    评估流程：
+        1. 用 prompt 作为 system_prompt 构造临时 Agent（通过 agent_factory）
+        2. 对 task_set 中每个任务跑 Agent.run
+        3. 对每个结果做 schema 校验 + 关键字命中检查（通过=1.0/失败=0.0）
+        4. 聚合为平均 score + 每任务详情 feedback
+
+    任务集格式（list[dict]）：
+        [
+            {
+                "task": "用户输入文本",
+                "expected_schema": {...},      # 可选，JSON Schema 校验
+                "expected_keywords": ["关键字"], # 可选，需全部命中
+            },
+            ...
+        ]
+
+    agent_factory: callable(system_prompt: str) -> Agent
+        用户注入的 Agent 构造函数，评估器用它为每个 prompt 新建临时 Agent。
     """
 
     def __init__(
         self,
         task_set: list[dict],
-        evaluator: object | None = None,
-        agent_factory: object | None = None,
+        agent_factory: object,
     ) -> None:
         self._task_set = task_set
-        self._evaluator = evaluator
         self._agent_factory = agent_factory
 
-    def evaluate(self, prompt: str) -> FitnessResult:
-        """在任务集上评估 prompt。
+    def _evaluate_single(self, agent: Any, task: dict) -> tuple[float, str]:
+        """评估单个任务：跑 Agent → schema + 关键字检查。返回 (score, feedback)。"""
+        user_input = task["task"]
+        expected_schema = task.get("expected_schema")
+        expected_keywords = task.get("expected_keywords", [])
 
-        真实实现流程：
-        1. 用 prompt 作为 system_prompt 构造测试 Agent
-        2. 对 task_set 中每个任务跑 Agent.run
-        3. 用 evaluator 对每个结果打分
-        4. 聚合为平均 score + feedback
-        """
-        raise NotImplementedError(
-            "TaskSetFitnessEvaluator 需用户实现 evaluate 逻辑（4.2b 只留骨架）"
+        # 跑 Agent
+        result = agent.run(user_input)
+        # Agent.run 返回 str（最终答案）
+        artifact = result if isinstance(result, str) else str(result)
+
+        # Schema 校验（复用 patterns._common._validate_artifact_schema）
+        if expected_schema:
+            from ..patterns._common import _validate_artifact_schema
+            schema_ok, schema_err = _validate_artifact_schema(artifact, expected_schema)
+            if not schema_ok:
+                return (0.0, f"schema 校验失败: {schema_err}")
+
+        # 关键字命中检查
+        if expected_keywords:
+            missing = [kw for kw in expected_keywords if kw not in artifact]
+            if missing:
+                return (0.0, f"关键字缺失: {missing}")
+
+        return (1.0, "通过")
+
+    def evaluate(self, prompt: str) -> FitnessResult:
+        """在任务集上评估 prompt，返回 FitnessResult。"""
+        agent = self._agent_factory(prompt)
+        task_results: list[dict] = []
+        passed_count = 0
+
+        for idx, task in enumerate(self._task_set):
+            score, feedback = self._evaluate_single(agent, task)
+            task_results.append({
+                "task_idx": idx,
+                "task": task["task"],
+                "score": score,
+                "feedback": feedback,
+            })
+            if score >= 1.0:
+                passed_count += 1
+
+        total = len(self._task_set)
+        avg_score = passed_count / total if total > 0 else 0.0
+        feedback = f"任务集通过 {passed_count}/{total}：\n" + "\n".join(
+            f"  [{r['task_idx']}] score={r['score']:.1f} {r['feedback']}"
+            for r in task_results
+        )
+
+        return FitnessResult(
+            score=avg_score,
+            feedback=feedback,
+            task_results=task_results,
         )
