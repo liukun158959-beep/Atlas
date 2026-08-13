@@ -381,6 +381,12 @@ log.warning("saga.compensate.complete",
 - **circuit_retry_demo.py（Phase 2.2 demo）**：4 场景断言全可复现——① flaky_api 幂等 retry_max=3 连抛 3 次 RuntimeError 第 4 次成功 ② unreliable_svc 幂等 retry_max=1 永远 TimeoutError → retry_exhausted ③ credit_card_charge 非幂等 retry_max=0 带 compensate 退款 ④ 手动触发熔断器 Open → circuit_rejected 不产生副作用；支持 `--mock --plain` 断言模式与 `--mock --dashboard` 可视模式
 - **PlannerWorkerCritic 模式包（Phase 2.3）**：`atlas.patterns.PlannerWorkerCritic` 产品级多 Agent 模式——Planner 拆解 → 串行 Worker 执行 → Critic 审查 → FAIL 打回重做（Worker 输入追加 Critic 评语 + 前一版结果）→ max_revisions 耗尽标 failed 不 abort → Planner 汇总标注；多层嵌套 Agent（Planner/Worker/Critic 都是内核 Agent 实例，Worker 通过 `worker_tools` 注入业务工具，Planner/Critic 纯文本推理）；Python while 控制 Critic 循环（LLM 只做内容判断不控制次数）；构造函数必填 2 + 可选 10 = 12 项（≤ DR-2 15 限额）；3 角色内置 system prompt 模板可覆写；返回 `PWCResult(final_answer, trace: PWCTrace)` 扁平可观测结构（plan_items / worker_runs / critic_reviews）；独立于 `atlas.core`，不进顶层导出（`from atlas.patterns import PlannerWorkerCritic`）
 - **pwc_demo.py（Phase 2.3 demo）**：5 项断言全可复现——① plan 拆解 3 项 ② Worker schema 校验 ③ Critic 打回 1 次后通过（revisions=1）④ 最终答案含关键字 ⑤ 重做 Worker 输入含 Critic 评语；FakeLLM 10 次调用精确映射 PWC 全流程；支持 `--mock --plain` 断言模式与 `--real` 真实 LLM 模式
+- **工作流图 Graph + Edge 控制流边（Phase 3.1）**：`atlas.core.Graph` 解释器模式（运行时遍历，不预编译）；命令式 API（`add_node`/`add_edge`/`add_conditional_edges`/`set_entry_point`/`set_exit_point`，和 LangGraph 对齐）；两类边 `Edge`（无条件跳转）+ `ConditionalEdge`（`condition(state)→key→mapping[key]` 动态路由）；节点签名 `Callable[[dict], dict]`，Agent 和普通函数都支持；统一 `dict` in/out + `state.update(output)` merge 语义；保留字 `END` 表示终止；run() 入口 lazy 验证（缺 entry_point / 节点未注册 / 无 END 可达路径 → ValueError）；终止三来源（END 节点 / `max_iterations` 兜底默认 50 / 可选 `terminator` 全局终止条件，和 Agent 对齐）；复用 `on_turn_start/on_turn_finish` 插件钩子，不新增 Graph 专属钩子
+- **ParallelNode 并行汇聚（Phase 3.1）**：`atlas.core.ParallelNode(fns)` 单节点内嵌 fan_out + and_ 汇聚；`__call__(state)` 签名和普通函数节点对齐，可直接 `add_node('p', ParallelNode([a,b,c]))`；每个 fn 收同一份 state 深拷贝（防互相污染）；结果按 fns 顺序合并成 list 放到 `state['parallel_results']`（不是完成顺序）；fail-fast 错误传播（任一 fn 抛异常 → 取消未完成 + raise，不静默吞错，DR-8 对齐）
+- **GraphTrace 扁平可观测存档（Phase 3.1）**：`Graph.run()` 返回 `GraphResult(final_state, trace)`；`GraphTrace` 含 `node_executions`（每个节点的输入快照/输出/耗时/错误）+ `edge_routings`（from_node/condition_key/to_node 路由决策链）+ 起止时间 + 总耗时 + iterations + terminated_by；trace 完全扁平，不做嵌套，便于 Dashboard 直接渲染
+- **react_graph 桥接函数（Phase 3.1）**：`react_graph(agent)` 把 Agent 包装成单节点 Graph，验证"Agent 循环能用 Graph 语法表达"设计假设；最小形态单节点 Graph（`agent.run(state['input']) → {'answer': ...}`）无循环，用户要自我修正循环可 `add_conditional_edges` 自行表达
+- **edge_demo.py（Phase 3.1 demo）**：5 项断言全可复现——① 节点执行顺序 `[start, worker, worker]` ② 边路由记录 3 条（普通边 start→worker + 条件边 worker→worker(refine) + worker→END(end)）③ 最终答案含"完善" ④ `terminated_by == "END"` ⑤ worker 第 2 次输入包含第 1 次输出（验证 state 在节点间传递）
+- **parallel_edge_demo.py（Phase 3.1 demo）**：4 项断言全可复现——① 3 个 Worker 并行执行（start_ts 差值 < 50ms）② 汇聚结果 `parallel_results` 长度=3（顺序 a,b,c）③ summarizer 收到合并 state（summary=['a:20','b:30','c:110']）④ 总耗时 < 串行基准 0.300s
 
 ## 技术栈
 
@@ -526,6 +532,14 @@ python examples/circuit_retry_demo.py --mock --dashboard
 # 定位差异：parallel_subagent_demo = 并行加速（纯 fan-out，无依赖、无 Critic）
 #           pwc_demo = 质量闭环（串行 + Critic 打回重做，不求快但求稳）
 python examples/pwc_demo.py --mock --plain
+
+# Phase 3.1：Edge 控制流边（条件分支 + 循环 + state 传递，5 项断言全可复现）
+# start -> worker -> (条件边: answer 含"完善" ? end : refine) -> worker(loop) / END
+python examples/edge_demo.py --plain
+
+# Phase 3.1：Parallel 并行汇聚（ParallelNode 扇出 + and_ 汇聚，4 项断言全可复现）
+# parallel_1(3 Worker 并行各 sleep 0.1s) -> summarizer -> END，并行耗时 < 串行基准
+python examples/parallel_edge_demo.py --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -553,6 +567,7 @@ Atlas/
 │   │   ├── terminator.py   # Terminator Protocol + 6 内置 + CompositeTerminator（| 组合）+ make_default_terminator()（MaxSteps/Timeout/TokenBudget/CostCap/RepetitionDetector）
 │   │   ├── evaluator.py    # Phase 2.1 新增：Evaluator Protocol（@runtime_checkable）+ ArtifactSchemaEvaluator（JSON Schema 契约校验，内核外独立调用，Agent 不自评）
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
+│   │   ├── graph.py        # Phase 3.1 新增：Graph（解释器模式）+ Edge/ConditionalEdge + ParallelNode（fan_out+and_汇聚）+ GraphTrace/GraphResult + react_graph 桥接函数
 │   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire(key) context manager）
 │   ├── journal/            # 执行日志 event sourcing
 │   │   ├── __init__.py     # re-export JournalProtocol/JournalEvent/InMemoryJournal/SQLiteJournal
@@ -603,7 +618,9 @@ Atlas/
 │   ├── compact_demo.py     # Phase 1 新增：Compact 机制演示（--mock 第 4 轮 token=8500 触发，5 项断言）
 │   ├── scope_demo.py       # Phase 1 第二批：Scope 演示（同 key 串行 + 不同 key 并行 + state 写回 3 断言）
 │   ├── dashboard_demo.py   # Phase 1 第二批：Dashboard 演示（后台起 server + 3 轮 mock quickstart publish）
-│   └── circuit_retry_demo.py # Phase 2.2 新增：熔断器三态 + 指数退避重试 demo（4 场景断言：flaky 重试成功 / unreliable retry_exhausted / credit_card 非幂等补偿 / 手动熔断 circuit_rejected）
+│   ├── circuit_retry_demo.py # Phase 2.2 新增：熔断器三态 + 指数退避重试 demo（4 场景断言：flaky 重试成功 / unreliable retry_exhausted / credit_card 非幂等补偿 / 手动熔断 circuit_rejected）
+│   ├── edge_demo.py          # Phase 3.1 新增：Edge 控制流边 demo（条件分支 + 循环 + state 传递，5 项断言：节点顺序/边路由/最终答案/terminated_by/state 传递）
+│   └── parallel_edge_demo.py # Phase 3.1 新增：Parallel 并行汇聚 demo（ParallelNode 扇出 + and_ 汇聚，4 项断言：并行执行/结果长度/汇总内容/耗时）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -682,10 +699,24 @@ Phase 2 严格遵循"内核只提供原语、上层组合 SOP"的分层原则。
 
 ### Phase 3：工作流原语
 
-- [ ] Edge（普通/条件边，表达顺序/分支/循环）
-- [ ] Parallel（扇出并行 + and_/or_ 汇聚）
-- [ ] Suspend/Resume（durable HITL，不用进程内 sleep）
-- [ ] 可插拔持久化后端（SQLite 默认 / Temporal 可选）
+同一套 Step/State/Edge/Parallel/Suspend/Journal/Scope 原语，既能表达单 Agent 循环，也能表达多 Agent 工作流。复杂 DAG / 条件分支编排直接集成 LangGraph，内核工作流原语只做"同一套原语支撑单 Agent 循环和多 Agent 工作流"的最小集。
+
+#### 3.1 内核原语：Edge 控制流边 + Parallel 并行汇聚（控制平面，必做）
+
+- [x] **Graph 工作流图（解释器模式）**—— `atlas.core.Graph` 运行时遍历图结构（不预编译）；命令式 API（`add_node`/`add_edge`/`add_conditional_edges`/`set_entry_point`/`set_exit_point`，和 LangGraph 对齐）；节点签名 `Callable[[dict], dict]`，Agent 和普通函数都支持；统一 `dict` in/out + `state.update(output)` merge 语义；保留字 `END` 表示终止；run() 入口 lazy 验证（缺 entry_point / 节点未注册 / 无 END 可达路径 → ValueError，不兜底）
+- [x] **Edge 控制流边（普通边 + 条件边）**—— `Edge`（from_node → to_node 无条件跳转）+ `ConditionalEdge`（`condition(state)→key→mapping[key]` 动态路由）；表达顺序/分支/循环（条件边 mapping 指回 from_node 即循环）；允许环但必须有 END 可达路径或显式 exit_point（_validate 兜底防死循环）；每节点只支持一条出边，多分支用条件边表达
+- [x] **Parallel 并行汇聚（ParallelNode）**—— `ParallelNode(fns)` 单节点内嵌 fan_out + and_ 汇聚；`__call__(state)` 签名和普通函数节点对齐；每个 fn 收同一份 state 深拷贝（防互相污染）；结果按 fns 顺序合并成 list 放到 `state['parallel_results']`（不是完成顺序）；fail-fast 错误传播（任一 fn 抛异常 → 取消未完成 + raise，不静默吞错，DR-8 对齐）；ThreadPoolExecutor 实现
+- [x] **GraphTrace 扁平可观测存档**—— `Graph.run()` 返回 `GraphResult(final_state, trace)`；`GraphTrace` 含 `node_executions`（输入快照/输出/耗时/错误）+ `edge_routings`（from_node/condition_key/to_node 路由决策链）+ 起止时间 + 总耗时 + iterations + terminated_by；trace 完全扁平，不做嵌套，便于 Dashboard 直接渲染
+- [x] **终止三来源**—— END 节点（正常结束）/ `max_iterations` 兜底（默认 50，防 runaway）/ 可选 `terminator` 全局终止条件（和 Agent 对齐，支持 MaxSteps/Timeout/CostCap 等组合器）
+- [x] **插件钩子复用**—— 复用现有 `on_turn_start/on_turn_finish` 钩子（把节点执行映射为 turn 语义），不新增 Graph 专属钩子，保持钩子总数 17 不变
+- [x] **react_graph 桥接函数**—— `react_graph(agent)` 把 Agent 包装成单节点 Graph，验证"Agent 循环能用 Graph 语法表达"设计假设；最小形态单节点 Graph 无循环，用户要自我修正循环可 `add_conditional_edges` 自行表达
+- [x] **edge_demo.py**—— 5 项断言全可复现（节点执行顺序 / 条件边路由记录 / 最终答案 / terminated_by / state 在节点间传递）
+- [x] **parallel_edge_demo.py**—— 4 项断言全可复现（3 Worker 并行执行 / 汇聚结果长度 / summarizer 收到合并 state / 总耗时 < 串行基准）
+
+#### 3.2 Suspend/Resume（HITL，规划中）
+
+- [ ] Suspend/Resume（durable HITL，不用进程内 sleep）—— 挂起等待外部输入，崩溃不丢，复用 Journal event sourcing 恢复
+- [ ] 可插拔持久化后端（SQLite 默认 / Temporal 可选）—— Graph 执行状态入 Journal，崩溃可断点续跑
 
 ### Phase 4：RSI 自进化（上下文层 + 工具层）
 

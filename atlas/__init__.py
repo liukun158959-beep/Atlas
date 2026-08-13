@@ -5,6 +5,7 @@ from .context.trace import StepRecord, Trace
 from .context.transcript import Transcript
 from .core.agent import Agent
 from .core.evaluator import ArtifactSchemaEvaluator, Evaluator
+from .core.graph import Graph, GraphResult, GraphTrace, ParallelNode
 from .core.multi_agent import (
     RoleConfig,
     SubagentResult,
@@ -39,6 +40,10 @@ __all__ = [
     "CompactManager",
     "Transcript",
     "Scope",
+    "Graph",
+    "GraphResult",
+    "GraphTrace",
+    "ParallelNode",
     "JournalProtocol",
     "JournalEvent",
     "InMemoryJournal",
