@@ -412,6 +412,8 @@ log.warning("saga.compensate.complete",
 - **prompt_evolution_demo.py（Phase 4.2b demo）**：8 项断言全可复现——① 返回 EvolutionResult ② fitness score ∈ [0,1] ③ 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）④ LeakageGuard 拦截越狱 ⑤ apply 后 system_prompt 替换（generation 0→1）⑥ archive 记录通过+失败 ⑦ 多代进化（gen2 fitness 0.8 > gen1 0.4）⑧ RegexLeakageGuard 正则黑名单命中（matched_patterns 非空）
 - **收敛检测 + 多代回滚（Phase 4.2b 增强）**：`EvolutionSummary(generations, final_generation, final_score, stop_reason)` 多代汇总；`Agent.evolve_prompt_until_converged(max_generations=10, convergence_n=3, convergence_threshold=0.01, no_progress_n=3)` 委托 `atlas.rsi.evolve_prompt_until_converged()`，三种停止条件（converged=连续 N 代 apply 成功 fitness 提升 < threshold / max_generations=达上限 / no_progress=连续 N 代未 apply 成功）；`Agent.rollback_to(target_generation)` 委托 `atlas.rsi.rollback_to()`，target=0 恢复第 1 代提案的 current_value（原始 prompt），target=N 恢复第 N 代提案的 proposed_value，同步回退 `agent.generation`，无对应通过提案直接 ValueError（不兜底）；`ArchiveStore` 扩 `ArchivedProposal.generation`（apply 成功时 = agent.generation，失败 = -1）+ `list_by_generation(generation)` + `get_passed_at(generation)`（每代至多 1 条通过）
 - **prompt_converge_rollback_demo.py（Phase 4.2b 增强 demo）**：8 项断言全可复现——① 返回 EvolutionSummary ② Part 1 converged（Part1ConvergenceFitness 0.2→0.5→0.7→0.71→0.72→0.72→0.721，最近 3 代 [0.72,0.72,0.721] deltas=[0,0.001] max=0.001<0.01，共 7 代收敛）③ Part 2 max_generations（max_generations=2 只跑 2 代停止）④ Part 3 no_progress（Part3NoProgressThenSuccess 0.3→0.2→0.4 连续 3 低分未 apply，stop_reason=no_progress，共 3 代）⑤ rollback_to(0) 恢复原始 prompt + generation=0 ⑥ rollback_to(1) 恢复第 1 代 proposed_value + generation=1 ⑦ generations 列表长度（P1=7 / P2=2 / P3=3）⑧ rollback generation 回退（gen2=2 → rb0=0 → rb1=1）
+- **评估器重构 · LLM-as-Judge 多维 Rubric（Phase 4.2b 评估器升级）**：将 benchmark 评估器从硬编码关键字匹配重构为 LLM-as-Judge 多维 Rubric 评估；参考 **GEPA** 结构化失败类型（formatting/reasoning/both）+ **ICAIL** 宽松判官原则（语义匹配不强制特定表达式）+ **DoorDash** 多维加权评分（Correctness 0.5 + Format 0.3 + Reasoning 0.2）+ **UnlimitedJudge** 通用模型稳定性验证（3 轮重复评估标准差=0，failure_type 100% 一致）；5 场景覆盖（数学推理/逻辑推理/格式遵从/安全边界/多约束写作），每场景独立 Judge prompt；安全场景 Judge 显式区分"提到危险名词（教育性拒绝）≠ 给出可操作步骤（配合请求）"；进化效果从硬编码时代 -6.7% 提升到 +3.3%；透明 Walkthrough 脚本 `_evaluator_transparent_walkthrough.py` 展示每一步输入输出（Judge prompt 完整输入、JSON 原始输出、分数映射过程、A/B 对比、多代进化轨迹），消除黑盒
+- **业界标准 Benchmark（Phase 4.2b 验证）**：`prompt_evolution_benchmark.py`（3 场景 × 5 题，LLM-Judge 评估器）+ `prompt_evolution_complex_benchmark.py`（复杂场景，LLM-Judge 评估器）+ `_evaluator_ab_test.py`（硬编码 vs LLM-Judge A/B 对比）+ `_evaluator_transparent_walkthrough.py`（3 模块透明 Walkthrough：数学 A/B + 安全判官误区 + 完整多代进化闭环）
 
 ## 技术栈
 
@@ -855,6 +857,31 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 - [x] **V1 单步 + V2 两个 demo 16 项 + V3 全回归**（21 demo 通过：tool_abi/terminator/plugin_cost/saga/compact/scope/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/taskset_fitness/prompt_evolution/prompt_converge_rollback + 其他回归；journal_replay/circuit_retry 因旧 RichRenderer.available() 遗留报错非本次修改，其余全绿）
 - [x] **V1 单步 + V2 demo 8 项 + V3 全回归**（19 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/dashboard/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/tool_abi/prompt_evolution）
 - [x] **FREE 层说明**—— 4.2b 实际在 BUFFERED 层（system_prompt 受控修改 + evaluate + leakage 门控），FREE 自由层沙箱留给未来工具自生成场景
+
+### Phase 5：产品化与生态（规划中）
+
+Phase 4 完成了 RSI 自进化基础设施（感知层 + 修改层 + Prompt 进化 + 评估器），Phase 5 聚焦"从 demo 级到产品级"的跨越：端到端体验、真实场景验证、开发者生态。
+
+#### 5.1 端到端产品体验
+
+- [ ] **Atlas CLI 增强**—— `atlas run <task>` 一键跑通端到端（自动选 Agent 配置 + 加载工具 + 执行 + 输出结果）；`atlas evolve` 一键触发 Prompt 进化（指定任务集 + 评估器 + 代数，后台跑完输出最优 prompt + 进化报告）
+- [ ] **Web UI 进化面板**—— Dashboard 扩展 RSI 面板：进化轨迹图（fitness 曲线 + 每代 diff 摘要）、回滚操作按钮、fitness 评估明细展开
+- [ ] **配置化 Agent 声明**—— YAML 声明式 Agent 配置（system_prompt + tools + skills + fitness_evaluator + evolution 参数），`atlas run --config agent.yaml` 直接加载
+- [ ] **进化报告导出**—— 进化完成后自动生成 Markdown 报告（初始 prompt → 每代改动 + fitness → 最终 prompt + 前后对比）
+
+#### 5.2 真实场景验证
+
+- [ ] **编码场景 Benchmark**—— 在真实代码生成任务上验证 Prompt 进化效果（如 HumanEval / MBPP 子集，评估代码正确率 + 格式规范 + 推理质量）
+- [ ] **多轮对话场景**—— 验证 Prompt 进化在多轮对话中的效果（不只是单轮 task，还包括上下文理解 + 话题切换 + 长对话 compact 后的 prompt 鲁棒性）
+- [ ] **A/B 测试框架**—— `atlas ab_test` 命令：同一任务集，初始 prompt vs 进化后 prompt，跑 N 轮取均值 + 标准差 + 显著性检验
+- [ ] **Safety 退化检测**—— 在 propose prompt 中注入 safety 元规则（进化不可降低安全约束），防止 Prompt 进化优化 format 维度时损害 safety 维度
+
+#### 5.3 开发者生态
+
+- [ ] **自定义 Evaluator 接口**—— 标准化 `FitnessEvaluator` 的 agent_factory 注入协议，用户可一行注册自定义评估器（`@atlas.evaluator("my_benchmark")`）
+- [ ] **Skill Marketplace 雏形**—— SkillLibrary 支持导入/导出 JSON 包（skill code + description + version + fitness_score），用户间共享技能
+- [ ] **Plugin Marketplace 雏形**—— 标准化 Plugin 打包格式（`atlas-plugin-<name>` PyPI 包，`atlas plugin install` 一键安装）
+- [ ] **文档站点**—— MkDocs 自动从 README + docstring 生成文档站点，API Reference + 教程 + 示例索引
 
 ### 不做
 
