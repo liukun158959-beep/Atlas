@@ -24,6 +24,9 @@ build/
 *.log
 run_*.log
 
+# 运行时数据（RSI demo 产生的向量数据库等）
+.atlas/
+
 # 临时文件
 docs_feishu/tmp/
 *.tmp

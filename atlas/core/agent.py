@@ -61,6 +61,8 @@ class Agent:
         # Phase 4.1：RSI 自进化基础设施（None 时 inspect_self 返回空 list，零侵入）
         skill_library: Any | None = None,
         failure_memory: Any | None = None,
+        # Phase 4.2a：提案归档存储（None 时 self_evolve 跳过归档，零侵入）
+        archive_store: Any | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -105,6 +107,8 @@ class Agent:
         # Phase 4.1：RSI 自进化基础设施引用
         self.skill_library = skill_library
         self.failure_memory = failure_memory
+        # Phase 4.2a：提案归档存储引用
+        self.archive_store = archive_store
         # 遍历已注册插件，对有 bind_agent 方法的自动注入 Agent 弱引用
         for plugin in self.plugin_manager.plugins:
             if hasattr(plugin, "bind_agent"):
@@ -156,6 +160,28 @@ class Agent:
         """
         from ..rsi.inspector import build_self_snapshot
         return build_self_snapshot(self)
+
+    # ------------------------------------------------------------------
+    # Phase 4.2a：RSI 自进化闭环
+    # ------------------------------------------------------------------
+
+    def propose_diff(self) -> Any:
+        """调 LLM 生成自进化提案，返回 ProposedDiff。
+
+        委托给 atlas.rsi.propose_diff()，Agent 只做委托。
+        Q6=A：和 inspect_self 一致的委托模式。
+        """
+        from ..rsi.evolver import propose_diff
+        return propose_diff(self)
+
+    def self_evolve(self) -> Any:
+        """自进化闭环：propose → evaluate → apply/archive，返回 EvaluationResult。
+
+        委托给 atlas.rsi.self_evolve()，archive_store 从 self.archive_store 读取。
+        Q10=A：一行调用完成自进化。
+        """
+        from ..rsi.evolver import self_evolve
+        return self_evolve(self)
 
     def _journal_append(self, run_id: str, event_type: str, payload: dict) -> None:
         """便捷方法：向 Journal 追加事件（若 journal 未注入则跳过）。"""
