@@ -63,6 +63,9 @@ class Agent:
         failure_memory: Any | None = None,
         # Phase 4.2a：提案归档存储（None 时 self_evolve 跳过归档，零侵入）
         archive_store: Any | None = None,
+        # Phase 4.2b：Prompt 进化基础设施（None 时 evolve_prompt 报错，零侵入）
+        fitness_evaluator: Any | None = None,
+        leakage_guard: Any | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
@@ -109,6 +112,10 @@ class Agent:
         self.failure_memory = failure_memory
         # Phase 4.2a：提案归档存储引用
         self.archive_store = archive_store
+        # Phase 4.2b：Prompt 进化基础设施引用 + generation 计数器
+        self.fitness_evaluator = fitness_evaluator
+        self.leakage_guard = leakage_guard
+        self.generation: int = 0
         # 遍历已注册插件，对有 bind_agent 方法的自动注入 Agent 弱引用
         for plugin in self.plugin_manager.plugins:
             if hasattr(plugin, "bind_agent"):
@@ -182,6 +189,19 @@ class Agent:
         """
         from ..rsi.evolver import self_evolve
         return self_evolve(self)
+
+    # ------------------------------------------------------------------
+    # Phase 4.2b：Prompt 进化
+    # ------------------------------------------------------------------
+
+    def evolve_prompt(self) -> Any:
+        """Prompt 进化闭环：propose → fitness → leakage → apply/archive，返回 EvolutionResult。
+
+        委托给 atlas.rsi.evolve_prompt()，fitness_evaluator/leakage_guard/archive_store 从 self 读取。
+        Q7=B：专门触发 prompt 进化，和 self_evolve（综合进化）并列。
+        """
+        from ..rsi.prompt_evolver import evolve_prompt
+        return evolve_prompt(self)
 
     def _journal_append(self, run_id: str, event_type: str, payload: dict) -> None:
         """便捷方法：向 Journal 追加事件（若 journal 未注入则跳过）。"""

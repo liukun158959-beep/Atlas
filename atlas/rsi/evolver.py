@@ -272,10 +272,11 @@ def apply_diff(agent: Any, proposal: ProposedDiff) -> None:
         skill_library.register(new_skill)
     elif proposal.target_type == "system_prompt":
         # Q18=A：验证 role==system + 替换 content，不清空历史
-        messages = agent.memory.messages
+        # 注意：必须用 runtime_messages（原始列表），messages property 返回的是 project() 投影后的新列表，修改不生效
+        messages = agent.memory.runtime_messages
         if not messages or messages[0].get("role") != "system":
             raise RuntimeError(
-                "memory.messages[0] 不是 system 消息，无法替换 system_prompt"
+                "memory.runtime_messages[0] 不是 system 消息，无法替换 system_prompt"
             )
         messages[0]["content"] = proposal.proposed_value
     else:

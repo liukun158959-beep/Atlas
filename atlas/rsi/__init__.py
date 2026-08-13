@@ -1,4 +1,4 @@
-"""RSI 自进化模块：Skill Library + 失败记忆 + inspect_self + 自进化闭环。
+"""RSI 自进化模块：Skill Library + 失败记忆 + inspect_self + 自进化闭环 + Prompt 进化。
 
 Phase 4.1 基础设施（感知+记忆层）：
 - EmbeddingProtocol + FakeEmbedding / OpenAIEmbedding
@@ -11,6 +11,11 @@ Phase 4.2a 自进化闭环（修改层）：
 - PermissionLevel + check_permission + ArchiveStore（分层权限 + 提案归档）
 - ProposedDiff + EvaluationResult dataclass
 - propose_diff / evaluate / apply_diff / self_evolve
+
+Phase 4.2b Prompt 进化（反思式变异 + 适应度 + Leakage Guardrails）：
+- FitnessEvaluator + FitnessResult + FakeFitnessEvaluator（适应度评估）
+- LeakageGuard + LeakageCheckResult + RegexLeakageGuard（越狱防护）
+- EvolutionResult + evolve_prompt（Prompt 进化闭环）
 """
 from __future__ import annotations
 
@@ -25,7 +30,15 @@ from .evolver import (
     self_evolve,
 )
 from .failure import FailureCase, FailureMemory, FailureMemoryCollector
+from .fitness import FakeFitnessEvaluator, FitnessEvaluator, FitnessResult, TaskSetFitnessEvaluator
 from .inspector import SelfSnapshot, build_self_snapshot
+from .prompt_evolver import (
+    EvolutionResult,
+    LeakageCheckResult,
+    LeakageGuard,
+    RegexLeakageGuard,
+    evolve_prompt,
+)
 from .skill import Skill, SkillLibrary
 from .vector_store import SQLiteVectorStore, VectorHit, VectorStoreProtocol
 
@@ -60,4 +73,16 @@ __all__ = [
     "evaluate",
     "apply_diff",
     "self_evolve",
+    # Phase 4.2b：适应度评估
+    "FitnessEvaluator",
+    "FitnessResult",
+    "FakeFitnessEvaluator",
+    "TaskSetFitnessEvaluator",
+    # Phase 4.2b：Leakage Guardrails
+    "LeakageGuard",
+    "LeakageCheckResult",
+    "RegexLeakageGuard",
+    # Phase 4.2b：Prompt 进化闭环
+    "EvolutionResult",
+    "evolve_prompt",
 ]

@@ -406,6 +406,10 @@ log.warning("saga.compensate.complete",
 - **ArchiveStore 提案归档（Phase 4.2a）**：`atlas.rsi.ArchiveStore` 归档所有提案（通过 + 未通过）——`ArchivedProposal(proposal, evaluation, archived_at)`；`list_failed()` 返回失败提案，下次 `propose_diff` 时摘要注入 prompt 避免重复提议；Agent 构造函数新增 `archive_store` 可选参数（None 默认，零侵入）
 - **Agent 自进化方法（Phase 4.2a）**：`Agent.propose_diff()` + `Agent.self_evolve()` 委托 `atlas.rsi`（和 inspect_self 一致模式）；FakeLLM 5 次调用序列精确映射（成功闭环 #1-2 + 失败闭环 #3 不调 LLM + archive 反馈 #4-5）
 - **rsi_evolution_demo.py（Phase 4.2a demo）**：7 项断言全可复现——① propose_diff 返回 ProposedDiff ② check_permission 权限校验（skill=BUFFERED / graph=CORE）③ evaluate 测试通过（exec + 同名函数存在）④ evaluate 测试拒绝（语法错误不调 LLM，_step 不变）⑤ Critic 通过（passed=true/score=0.85）⑥ apply 版本递增（v1→v2 + 新 skill 可执行）⑦ archive 失败反馈（失败提案归档后下次 propose prompt 含归档摘要）
+- **Prompt 进化 · 反思式变异（Phase 4.2b）**：`atlas.rsi.FitnessEvaluator` Protocol（`evaluate(prompt) -> FitnessResult(score, feedback, task_results)`）+ `FakeFitnessEvaluator`（确定性序列 0.4/0.8/0.3，demo 100% 可复现）+ `TaskSetFitnessEvaluator`（真实接口预留，跑任务集 + Evaluator 打分）；单 lineage 反思式变异——`_extract_fitness_history` 从 `ArchiveStore.list_recent()` 提取适应度轨迹格式化为"第 N 代 score=X feedback=Y"注入下一代 propose prompt（反思依据）+ `_extract_archived_failures` 注入失败摘要避免重复提议
+- **Leakage Guardrails（Phase 4.2b）**：`atlas.rsi.LeakageGuard` Protocol（`check(prompt) -> LeakageCheckResult(passed, matched_patterns)`）+ `RegexLeakageGuard`（内置默认 ~10 个中英文越狱模式 ignore previous/忽略以上/you are now/你现在是/system override/jailbreak/DAN/忽略所有规则/disregard above/new instructions + `extra_patterns` 可追加，预编译正则忽略大小写）；在 fitness 通过后、apply 前执行，命中即 archive 为 failed（EvaluationResult(passed=False, feedback="leakage detected: [matched]")）
+- **Agent Prompt 进化方法（Phase 4.2b）**：`Agent.evolve_prompt() -> EvolutionResult` 委托 `atlas.rsi.evolve_prompt()`（和 self_evolve 并列，内部复用 4.2a apply_diff system_prompt 分支）；`EvolutionResult(generation, proposal, evaluation, leakage_check, applied)` 携带完整进化轨迹；Agent 构造函数新增 `fitness_evaluator` + `leakage_guard` 可选参数 + `generation: int = 0` 计数器（apply 成功后 +1，零侵入）
+- **prompt_evolution_demo.py（Phase 4.2b demo）**：8 项断言全可复现——① 返回 EvolutionResult ② fitness score ∈ [0,1] ③ 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）④ LeakageGuard 拦截越狱 ⑤ apply 后 system_prompt 替换（generation 0→1）⑥ archive 记录通过+失败 ⑦ 多代进化（gen2 fitness 0.8 > gen1 0.4）⑧ RegexLeakageGuard 正则黑名单命中（matched_patterns 非空）
 
 ## 技术栈
 
@@ -585,6 +589,10 @@ python examples/rsi_demo.py --plain
 # Phase 4.2a：RSI 自进化闭环（propose_diff + evaluate + apply + archive + 分层权限，7 项断言全可复现）
 # propose→evaluate→apply 成功闭环 + 测试拒绝不调 LLM + archive 失败反馈避免重复提议
 python examples/rsi_evolution_demo.py --plain
+
+# Phase 4.2b：Prompt 进化（反思式变异 + 适应度 + Leakage Guardrails，8 项断言全可复现）
+# 单 lineage 反思式变异 + FakeFitnessEvaluator 0.4→0.8 适应度上升 + RegexLeakageGuard 拦截越狱
+python examples/prompt_evolution_demo.py --plain
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -650,15 +658,17 @@ Atlas/
 │   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
 │   │   ├── planner_worker_critic.py # Phase 2.3 PlannerWorkerCritic 主实现 + 5 dataclass + 3 角色 prompt + _parse_plan/_parse_critic
 │   │   └── orchestrator_workers.py  # Phase 2.4 OrchestratorWorkers 主实现 + 4 dataclass + 2 角色 prompt + _parse_orchestrator_json
-│   ├── rsi/                # Phase 4.1 新增：RSI 自进化基础设施（独立于 core，和 patterns 同级）；Phase 4.2a 追加自进化闭环
-│   │   ├── __init__.py     # re-export 4.1 全部 + 4.2a PermissionLevel/check_permission/ArchivedProposal/ArchiveStore/ProposedDiff/EvaluationResult/propose_diff/evaluate/apply_diff/self_evolve
+│   ├── rsi/                # Phase 4.1 新增：RSI 自进化基础设施（独立于 core，和 patterns 同级）；Phase 4.2a 追加自进化闭环；Phase 4.2b 追加 Prompt 进化
+│   │   ├── __init__.py     # re-export 4.1 全部 + 4.2a PermissionLevel/check_permission/ArchivedProposal/ArchiveStore/ProposedDiff/EvaluationResult/propose_diff/evaluate/apply_diff/self_evolve + 4.2b FitnessEvaluator/FitnessResult/FakeFitnessEvaluator/LeakageGuard/LeakageCheckResult/RegexLeakageGuard/EvolutionResult/evolve_prompt
 │   │   ├── embedding.py    # EmbeddingProtocol（embed/embed_batch/dimension）+ FakeEmbedding（MD5 hash 64 维确定性）+ OpenAIEmbedding（复用 LLM client）
 │   │   ├── vector_store.py # VectorStoreProtocol（add/query/get/delete/count）+ VectorHit + SQLiteVectorStore（bytes 存 SQLite + 纯 Python 余弦相似度）
 │   │   ├── skill.py        # Skill dataclass（name/description/code/embedding/version/fitness_score）+ SkillLibrary（register/retrieve/get/list_all/latest_version）+ to_tool()
 │   │   ├── failure.py      # FailureCase dataclass + FailureMemory（record/retrieve/list_recent）+ FailureMemoryCollector(BasePlugin)（挂 3 钩子 + weakref 读 Agent 上下文）
 │   │   ├── inspector.py    # SelfSnapshot dataclass（5 字段）+ build_self_snapshot(agent)
 │   │   ├── archive.py      # Phase 4.2a 新增：PermissionLevel 枚举（CORE/BUFFERED/FREE）+ check_permission() + ArchivedProposal + ArchiveStore（add/list_recent/list_failed/list_passed/count）
-│   │   └── evolver.py      # Phase 4.2a 新增：ProposedDiff + EvaluationResult dataclass + propose_diff/evaluate/apply_diff/self_evolve + _parse_json（容错）+ _test_skill_code（exec + 同名函数存在）
+│   │   ├── evolver.py      # Phase 4.2a 新增：ProposedDiff + EvaluationResult dataclass + propose_diff/evaluate/apply_diff/self_evolve + _parse_json（容错）+ _test_skill_code（exec + 同名函数存在）
+│   │   ├── fitness.py      # Phase 4.2b 新增：FitnessResult dataclass + FitnessEvaluator Protocol + FakeFitnessEvaluator（0.4/0.8/0.3 确定性序列）+ TaskSetFitnessEvaluator（真实接口预留骨架）
+│   │   └── prompt_evolver.py # Phase 4.2b 新增：LeakageCheckResult + LeakageGuard Protocol + RegexLeakageGuard（默认 ~10 中英文越狱模式 + extra_patterns）+ EvolutionResult + evolve_prompt（反思式变异闭环）+ _build_evolution_prompt/_extract_fitness_history/_extract_archived_failures
 │   ├── providers.py        # LLM provider 预设表
 │   └── __main__.py         # CLI 入口：python -m atlas
 ├── examples/
@@ -680,7 +690,8 @@ Atlas/
 │   ├── parallel_edge_demo.py # Phase 3.1 新增：Parallel 并行汇聚 demo（ParallelNode 扇出 + and_ 汇聚，4 项断言：并行执行/结果长度/汇总内容/耗时）
 │   ├── suspend_resume_demo.py# Phase 3.2 新增：Suspend/Resume Durable HITL demo（7 项断言：挂起态字段/approved→发货/state保留+注入/reject→取消/Journal事件链/崩溃恢复双实例/resumed_from_seq一致）
 │   ├── rsi_demo.py          # Phase 4.1 新增：RSI 自进化基础设施 demo（8 项断言：SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self 空值零侵入 + FakeEmbedding 确定性）
-│   └── rsi_evolution_demo.py# Phase 4.2a 新增：RSI 自进化闭环 demo（7 项断言：propose_diff + 权限校验 + 测试通过 + 测试拒绝不调 LLM + Critic 通过 + apply 版本递增 + archive 失败反馈）
+│   ├── rsi_evolution_demo.py# Phase 4.2a 新增：RSI 自进化闭环 demo（7 项断言：propose_diff + 权限校验 + 测试通过 + 测试拒绝不调 LLM + Critic 通过 + apply 版本递增 + archive 失败反馈）
+│   └── prompt_evolution_demo.py # Phase 4.2b 新增：Prompt 进化 demo（8 项断言：EvolutionResult + fitness score + 反思式变异 + Leakage 拦截 + apply 替换 + archive 通过+失败 + 多代 fitness 上升 + 正则黑名单命中）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -815,9 +826,15 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 - [x] **rsi_evolution_demo.py**—— 7 项断言全可复现：propose_diff 返回 ProposedDiff / 权限校验 / 测试通过 / 测试拒绝不调 LLM / Critic 通过 / apply 版本递增 / archive 失败反馈
 - [x] **V1 单步 + V2 demo 7 项 + V3 全回归**（18 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/dashboard/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/tool_abi）
 
-#### Phase 4.2b：Prompt 进化（待实施）
+#### Phase 4.2b：Prompt 进化 · 反思式变异 + 适应度 + Leakage Guardrails（已完成）
 
-- [ ] Prompt 进化（GEPA 式反思遗传 + leakage guardrails）—— FREE 自由层沙箱实验
+- [x] **FitnessEvaluator 适应度评估**—— `FitnessEvaluator` Protocol（`evaluate(prompt) -> FitnessResult(score, feedback, task_results)`）+ `FakeFitnessEvaluator`（确定性序列 0.4/0.8/0.3，demo 100% 可复现）+ `TaskSetFitnessEvaluator`（真实接口预留骨架，跑任务集 + Evaluator 打分）
+- [x] **反思式变异（单 lineage）**—— `_extract_fitness_history` 从 `ArchiveStore.list_recent()` 提取适应度轨迹格式化为"第 N 代 score=X feedback=Y"注入下一代 propose prompt（反思依据）+ `_extract_archived_failures` 注入失败摘要避免重复提议；不做种群（Q1=A 最小版）
+- [x] **Leakage Guardrails**—— `LeakageGuard` Protocol（`check(prompt) -> LeakageCheckResult(passed, matched_patterns)`）+ `RegexLeakageGuard`（内置默认 ~10 个中英文越狱模式 + `extra_patterns` 可追加，预编译正则忽略大小写）；在 fitness 通过后、apply 前执行，命中即 archive 为 failed
+- [x] **evolve_prompt() 闭环**—— `Agent.evolve_prompt() -> EvolutionResult(generation, proposal, evaluation, leakage_check, applied)`（和 self_evolve 并列，内部复用 4.2a apply_diff system_prompt 分支）；Agent 新增 `fitness_evaluator` + `leakage_guard` 可选参数 + `generation: int = 0` 计数器（apply 成功后 +1，零侵入）
+- [x] **prompt_evolution_demo.py**—— 8 项断言全可复现：EvolutionResult / fitness score ∈ [0,1] / 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）/ LeakageGuard 拦截越狱 / apply 后 system_prompt 替换（generation 0→1）/ archive 记录通过+失败 / 多代进化（gen2 0.8 > gen1 0.4）/ RegexLeakageGuard 正则黑名单命中
+- [x] **V1 单步 + V2 demo 8 项 + V3 全回归**（19 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/dashboard/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/tool_abi/prompt_evolution）
+- [x] **FREE 层说明**—— 4.2b 实际在 BUFFERED 层（system_prompt 受控修改 + evaluate + leakage 门控），FREE 自由层沙箱留给未来工具自生成场景
 
 ### 不做
 
