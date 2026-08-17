@@ -30,10 +30,10 @@ Atlas 提供一个简洁、可控、可演进的通用 Agent 内核。内核只�
 每个模块都能单独拿出来用、单独替换。模块间只通过协议（Protocol）交互，不依赖具体实现。
 
 **工程约束**：
-- 依赖方向严格单向：`atlas-agent → atlas-core → atlas-llm`，绝不反向
+- 单包 `atlas`，模块依赖单向：`atlas.llm` 不得 import `atlas.core` / `atlas.rsi` / `atlas.patterns`（由 `tests/test_dr0_imports.py` 锁死）。不拆 atlas-llm / atlas-core / atlas-agent 三包
 - 对外暴露 Protocol / ABC，不是具体类
 - 具体实现通过配置 + 注册表注入，不 hardcode
-- 每个模块可以独立替换（如 Journal 从 SQLite 换成 PostgreSQL 只需改配置项）
+- 每个模块可以独立替换（Journal 后端走 Protocol；默认 SQLite，Postgres 未做）
 - 新增能力先写 Protocol，再写实现
 
 ### EP-3 组装式构建 + 可视化流程 + 简易 Dashboard
@@ -62,27 +62,25 @@ Agent 是搭积木组装的，不是堆叠函数调用写的。运行时能看�
 
 ```
 +--------------------------------------------------------------------+
-|                      atlas-agent（顶层：产品）                       |
-|  多 Agent 编排 / RSI 自进化引擎 / 预设场景（编码/研究/工作流）        |
+|  atlas.rsi / atlas.patterns / atlas.cli（上层：可选能力）            |
+|  RSI 自进化 / 多 Agent 模式包 / atlas run · dashboard               |
 +--------------------------------------------------------------------+
                                 |
 +--------------------------------------------------------------------+
-|                      atlas-core（中层：引擎）                       |
-|  AgentLoop（事件流 + 钩子 + steering）                              |
-|  9 个核心原语（Step/State/Journal/Scope/终止条件/Edge/Suspend/幂等/trace）|
-|  可插拔持久化后端（SQLite 默认 / Temporal 可选）                     |
-|  验证基础设施（Schema 校验 + 独立 Evaluator）                        |
-|  Compact 机制（Summary + Boundary + 状态重注入）                    |
-|  Attachment 机制（程序状态传递给模型）                               |
+|  atlas.core（中层：引擎）                                           |
+|  Runtime 组装面 + AgentLoop（durable 循环，同步）                    |
+|  Journal 必选（默认 SQLite，Postgres 未做；不引入 Temporal）          |
+|  PermissionPolicy / 分级 Compact / OTEL GenAI spans（opt-in extras） |
+|  Scope（进程内 per-key 隔离，非跨进程）                              |
 +--------------------------------------------------------------------+
                                 |
 +--------------------------------------------------------------------+
-|                      atlas-llm（底层：模型抽象）                     |
-|  统一 API + provider 预设 / 流式 + Token 追踪 / 重试                 |
+|  atlas.llm（底层：模型抽象）                                        |
+|  统一 API + provider 预设 / Token 追踪 / 重试                       |
 +--------------------------------------------------------------------+
 ```
 
-依赖方向永远向上，底层对上层一无所知。用户可以只用 `atlas-llm` 调模型，也可以用 `atlas-core` 跑 Agent Loop，完全不需要碰顶层。
+单包 `atlas`。依赖方向永远向上：底层对上层一无所知。可以只用 `atlas.llm` 调模型，也可以用 `Runtime` + `Agent` 跑循环，不必碰 RSI。
 
 ## 9 个核心原语
 
@@ -90,13 +88,13 @@ Agent 是搭积木组装的，不是堆叠函数调用写的。运行时能看�
 |---|---|---|
 | P0 | **Step（durable 步骤）** | 包装 LLM/工具调用，输入输出入 journal，崩溃可重放 |
 | P0 | **State（可持久化状态）** | 类型化共享状态，4 层分离（external/workflow/conversation/memory） |
-| P0 | **Journal（执行日志）** | append-only 事件日志，event sourcing 恢复，不是状态快照 |
-| P0 | **Scope（隔离单元）** | 按 key 隔离 Agent 实例，同 key 串行、跨 key 并行 |
+| P0 | **Journal（执行日志）** | 构造 Agent 时必选（默认 SQLite）；关键事件全量落盘；`restore(run_id)` 重建 Memory / saga / token |
+| P0 | **Scope（隔离单元）** | **进程内**按 key 隔离；同 key 串行、跨 key 并行。不跨进程、不跨机器 |
 | P0 | **终止条件组合器** | max_iter / timeout / token_budget / cost_cap / repetition_detector 用 \| 组合，默认开启 |
 | P1 | **Edge（控制流边）** | 普通/条件边，表达顺序/分支/循环，用同一套原语表达循环和图 |
-| P1 | **Suspend/Resume（HITL）** | durable 挂起等待外部输入，零成本等待，崩溃不丢 |
-| P1 | **幂等键 + Saga 补偿** | 副作用工具自动注入 idempotency_key，不可幂等动作必须注册补偿 |
-| P2 | **OTEL trace** | 每决策点产 span，trace_id 贯穿 run→subagent→step→tool_call |
+| P1 | **Suspend/Resume（HITL）** | durable 挂起等待外部输入；工具门控与 Graph SuspendNode 共用 `SuspendToken` |
+| P1 | **幂等键 + Saga 补偿** | 副作用工具自动注入 idempotency_key；Saga 栈写入 Journal，崩溃可恢复 |
+| P2 | **OTEL trace（opt-in）** | `pip install atlas[otel]`；span 树 `gen_ai.invoke_agent` → `inference` → `execute_tool`。未安装时 no-op。自研 `Trace` 仍给 Dashboard 投影 |
 
 ## 三大方向
 
@@ -148,9 +146,9 @@ Agent 是搭积木组装的，不是堆叠函数调用写的。运行时能看�
 同一套 Step/State/Edge/Parallel/Suspend/Journal/Scope 原语，既能表达单 Agent 循环，也能表达多 Agent 工作流。
 
 **关键设计**：
-- **Checkpoint ≠ Durable Execution** —— 内核做执行日志（event sourcing/journal），不是状态快照
-- **可插拔持久化后端** —— 开发用 SQLite/内存（零部署），生产接 Temporal/Restate
-- **HITL = durable wait** —— 挂起等待外部输入，崩溃不丢，不用进程内 sleep
+- **Checkpoint ≠ Durable Execution** —— 内核做执行日志（event sourcing/journal），不是状态快照。崩溃恢复靠 `Journal.restore(run_id)` + 幂等键短路副作用，不是重放节点。
+- **可插拔持久化后端** —— Journal Protocol 可插拔；默认 `SQLiteJournal(path="./.atlas/journal.db")`，开发/测试显式传 `InMemoryJournal(save_full_payload=True)`。Postgres / Temporal / Restate **未做**，也不引入外部 server。
+- **HITL = durable wait** —— 挂起等待外部输入，崩溃不丢；Agent 循环与 Graph 共用 `SuspendToken`。
 
 ## 消息体系
 
@@ -170,12 +168,13 @@ Message
 
 **Attachment 机制（已实现）**：`atlas.context.Attachment` 抽象基类 + `AttachmentRegistry` 字典注册表（重名 ValueError 拒绝）；子类覆写 `to_system_reminder()` 返回 system-reminder 文本；Runtime 层消息标记 `isMeta=True, type=attachment`；`project()` 时转成普通 `role=system` 消息插入 API messages，不会污染 LLM。上层按场景注册具体类型（file_state / task_status / skill_list / workflow_state），内核不硬编码任何具体类型。提供 `Memory.add_attachment(attachment)` 便捷方法。
 
-**Compact 机制（已实现）**：
-- **触发条件**：默认 `compact_threshold=8000`（Agent 参数，`None` 禁用）。每次 LLM 调用后从 `usage.prompt_tokens` 读取真实 token 数 → `memory.update_token_count()` → 超阈值时 `CompactManager.compact()` 自动触发。
-- **生成 9 段 Summary**：构造 9 段模板 prompt（用户目标/已完成步骤/关键发现/当前状态/待办事项/关键文件资源/错误与教训/决策记录/下一步建议）→ 复用 Agent 的 LLM 生成 Summary 文本（无 LLM 时退化为规则提取）。
-- **写入 Summary + Boundary 对**：`memory.add_summary()` 依次写入 `type=compact_summary`（assistant role, isMeta=True）+ `type=compact_boundary`（system role, isMeta=True）两条消息；同时重置 `memory.reset_token_count()`（下次从 Boundary 后重新累计）。
-- **project() 投影**：找最后一个 Boundary → 保留 system prompt + Summary + Boundary 之后的消息 → isMeta 过滤（Attachment 转 system，Summary 转 assistant，Boundary 跳过）→ 修 tool_call 配对 → 超阈值从最旧 user/assistant 对裁剪到阈值 × 0.7。
-- **Transcript 双写**：Memory 写入同时 `agent.transcript.append()`，append-only 事件存档 + JSONL 导出/恢复（`transcript.to_jsonl(path)` / `Transcript.from_jsonl(path)`）。
+**Compact 机制（已实现，分级）**：
+- **触发条件**：默认 `compact_threshold=8000`（`None` 禁用）。每次 LLM 调用后从 `usage.prompt_tokens` 读取真实 token 数 → 超阈值时 `CompactManager.apply()`。
+- **分级策略**：① 先裁剪过旧 `tool_result` 正文（保留 tool_call 配对）；② 仍超则滑窗丢掉最旧 user/assistant 对；③ 仍超才调 LLM 生成 9 段 Summary。略超阈值时不调 LLM。
+- **写入 Summary + Boundary 对**：LLM 路径才写 `compact_summary` + `compact_boundary`；同时 `memory.reset_token_count()`。
+- **Attachment 活状态重注入**：compact 之后调用 `AttachmentRegistry.rebuild_all(agent)`，从活状态重建 attachment，不把旧 isMeta 消息原样拷进新窗口。
+- **project() 投影**：找最后一个 Boundary → 保留 system prompt + Summary + Boundary 之后的消息 → isMeta 过滤 → 修 tool_call 配对 → 超阈值裁剪。
+- **Transcript 双写**：Memory 写入同时 `agent.transcript.append()`。
 
 ## Tool 层分类与副作用管理
 
@@ -397,10 +396,10 @@ log.warning("saga.compensate.complete",
 - **suspend_resume_demo.py（Phase 3.2 demo）**：7 项断言全可复现——① 挂起态 status+suspended_prompt 含订单/金额/商品 ② approved=True→shipped+SHIP-PO-999 ③ state 保留（order_id/amount/submitted）+ resume 注入（approved=True）④ approved=False→cancelled+拒绝理由 ⑤ Journal 事件链 ≥4 条（三种类型齐全）⑥ 双 Graph 实例崩溃恢复（del graph1→新建 graph2 同结构同 Journal→resume，结果和单实例 approved=True 100% 一致）⑦ `graph_resume.payload.resumed_from_seq == graph_suspend.seq`（审计链路一致）
 - **EmbeddingProtocol + FakeEmbedding / OpenAIEmbedding（Phase 4.1）**：`atlas.rsi.EmbeddingProtocol`（embed / embed_batch / dimension 三方法）；`FakeEmbedding` MD5 hash → 64 维归一化向量（跨进程确定性，demo 100% 可复现）；`OpenAIEmbedding` 复用 LLM 的 OpenAI 兼容 client（默认 text-embedding-3-small 1536 维），同 base_url / api_key
 - **VectorStoreProtocol + SQLiteVectorStore（Phase 4.1）**：`atlas.rsi.VectorStoreProtocol`（add / query / get / delete / count 五方法）+ `VectorHit(id, score, metadata)`；默认实现 `SQLiteVectorStore`：embedding 序列化 bytes 存 SQLite，检索时纯 Python 余弦相似度 top-k（零外部依赖，不引入 Chroma）；threading.Lock 线程安全
-- **Skill Library（Phase 4.1）**：`atlas.rsi.SkillLibrary` 代码即数据的技能注册/检索/版本化——`Skill(name, description, code, embedding, version, fitness_score)` dataclass 独立于 Tool；`register()` 自动 embed(description) + 同 name 版本递增；`retrieve(query)` 语义检索 top-k；`to_tool()` exec(code) → 提取同名函数 → 包装成 Tool（打通 SkillLibrary 和 Toolkit）；4.1 不做 Critic 入库闸门（留给 4.2）
+- **Skill Library（Phase 4.1）**：`atlas.rsi.SkillLibrary` 代码即数据的技能注册/检索/版本化——`Skill(name, description, code, embedding, version, fitness_score)` dataclass 独立于 Tool；`register()` 自动 embed(description) + 同 name 版本递增；`retrieve(query)` 语义检索 top-k；`to_tool()` 经 subprocess 受限解释器执行（超时、禁 builtins 白名单外符号，禁止进程内 `exec`；`open()` / `os.system()` 失败），包装成 Tool
 - **失败记忆 FailureMemory + Collector（Phase 4.1）**：`atlas.rsi.FailureMemory` 记录/语义检索/最近列表——`FailureCase(run_id, step_id, tool_name, input_summary, error_message, error_type, context_summary, embedding)` dataclass；`FailureMemoryCollector(BasePlugin)` 挂 `on_tool_after_call(failed)` / `on_retry_exhausted` / `on_compensate_failed` 三钩子实时采集；通过 `bind_agent(agent)` 注入 Agent 弱引用（weakref），从 `agent.memory.messages` 读取 system_prompt + user_input 构造 context_summary；Agent `__init__` 末尾遍历 plugins 自动 `hasattr(bind_agent)` 注入
 - **inspect_self() 自省（Phase 4.1）**：`Agent.inspect_self() -> SelfSnapshot`——Agent 方法委托 `atlas.rsi.build_self_snapshot()`；`SelfSnapshot` 5 字段：system_prompt / tool_definitions / skill_summaries / recent_failures / memory_summary；Agent 构造函数新增 `skill_library` + `failure_memory` 两个可选参数（None 默认，零侵入——现有 demo 无需改动）
-- **rsi_demo.py（Phase 4.1 demo）**：8 项断言全可复现——① SkillLibrary register + retrieve ② 版本化（同 name v1→v2）③ to_tool()（exec code → Tool.func）④ FailureMemory record + retrieve ⑤ Collector Plugin 自动采集（on_tool_after_call failed → FailureMemory）⑥ inspect_self()（SelfSnapshot 5 字段非空）⑦ 空值零侵入（skill_library=None + failure_memory=None → 空 list）⑧ FakeEmbedding 确定性（相同文本相同向量，dim=64）
+- **rsi_demo.py（Phase 4.1 demo）**：8 项断言全可复现——① SkillLibrary register + retrieve ② 版本化（同 name v1→v2）③ to_tool()（沙箱执行 skill code → Tool.func）④ FailureMemory record + retrieve ⑤ Collector Plugin 自动采集（on_tool_after_call failed → FailureMemory）⑥ inspect_self()（SelfSnapshot 5 字段非空）⑦ 空值零侵入（skill_library=None + failure_memory=None → 空 list）⑧ FakeEmbedding 确定性（相同文本相同向量，dim=64）
 - **分层权限模型（Phase 4.2a）**：`atlas.rsi.PermissionLevel` 三层级枚举（CORE 只读 / BUFFERED 受控 / FREE 预留）+ `check_permission(target_type)` 函数；核心层（graph/agent/tool/plugin）只读——propose_diff 抛 PermissionError；缓冲层（skill/system_prompt）受控——propose_diff 可修改但必须经 evaluate 通过
 - **RSI 自进化闭环（Phase 4.2a）**：`propose_diff(agent) -> ProposedDiff`（LLM 生成 JSON 提案，prompt 含 self_snapshot + recent_failures + archived_failures 避免重复）+ `evaluate(agent, proposal) -> EvaluationResult`（双层评估：测试执行 `exec(code)` + 同名函数存在校验 → 失败直接拒绝不调 LLM；通过后 LLM Critic 语义评估）+ `apply_diff(agent, proposal)`（skill 新版本入库 version 自动递增 / system_prompt 替换 messages[0].content 验证 role==system）+ `self_evolve(agent)` 一行完成 propose→evaluate→apply/archive 闭环
 - **ArchiveStore 提案归档（Phase 4.2a）**：`atlas.rsi.ArchiveStore` 归档所有提案（通过 + 未通过）——`ArchivedProposal(proposal, evaluation, archived_at)`；`list_failed()` 返回失败提案，下次 `propose_diff` 时摘要注入 prompt 避免重复提议；Agent 构造函数新增 `archive_store` 可选参数（None 默认，零侵入）
@@ -422,7 +421,9 @@ log.warning("saga.compensate.complete",
 - LLM 接入：兼容 OpenAI API 协议的模型均可接入
 - 终端渲染：`rich>=13.0`（RichRenderer），可退化为纯文本
 - 配置：`PyYAML>=6.0`（声明式 Role 与任务配置）
-- 持久化（规划中）：SQLite 默认 / Temporal 可选（可插拔后端）
+- 持久化：Journal 必选；默认 SQLite（`./.atlas/journal.db`），测试用内存 Journal。Postgres / Temporal 未做
+- 测试：`pytest`（`pip install -e ".[dev]"`）；CI 跑 `tests/` + 内核 demo
+- 观测：`pip install atlas[otel]` 启用 OTEL GenAI spans；未安装时 Tracer 为 no-op
 
 ## 安装与配置
 
@@ -443,6 +444,14 @@ python -m atlas init
 1. 在项目根目录创建 `.venv` 虚拟环境
 2. 用 venv 内的 python 执行 `pip install -e .` 安装 atlas
 3. 引导选择 LLM provider（Qwen / OpenAI / Deepseek / Moonshot / 智谱 / 自定义），输入 API Key，自动写入 `.env`
+
+开发依赖（pytest）与可选观测：
+
+```bash
+pip install -e ".[dev]"          # 测试
+pip install -e ".[otel]"         # OTEL GenAI spans（opt-in）
+python -m pytest tests -q
+```
 
 完成后按提示激活 venv 即可运行示例。
 
@@ -467,9 +476,11 @@ ATLAS_MODEL=qwen-plus
 
 ## 快速开始
 
+省略 `journal` 时默认写入 `./.atlas/journal.db`（`save_full_payload=True`）。显式 `journal=None` 会 `ValueError`。测试请传 `InMemoryJournal(save_full_payload=True)`。RSI 不进默认构造，需要时 `agent.bind_rsi(...)`。
+
 ```python
 from dotenv import load_dotenv
-from atlas import Agent, LLM, Toolkit
+from atlas import Agent, LLM, Toolkit, Runtime, InMemoryJournal
 from atlas.render import RichRenderer
 from atlas.tools.builtin import BUILTIN_TOOLS
 
@@ -484,13 +495,19 @@ agent = Agent(
     llm=llm,
     tools=tools,
     system_prompt="你是通用助手 Atlas，遇到需要计算或获取时间的问题请主动调用工具。",
-    # 注入 RichRenderer 即启用终端 Markdown 渲染（粗体/列表/代码块/LaTeX 近似），加 --plain 可退回纯文本
+    runtime=Runtime(journal=InMemoryJournal(save_full_payload=True)),
     renderer=RichRenderer(),
 )
-agent.run("先告诉我现在几点，然后计算 365 * 24 等于多少")
-
-# 查看执行轨迹
+print(agent.run("先告诉我现在几点，然后计算 365 * 24 等于多少"))
 print(agent.trace)
+# 崩溃后续跑：agent.resume(run_id) 或 agent.resume_detailed(run_id)
+```
+
+无手写 Python，YAML + CLI：
+
+```bash
+python -m atlas run --config examples/quickstart.yaml
+python -m atlas run --config examples/quickstart.yaml --resume <run_id>
 ```
 
 直接运行示例脚本：
@@ -542,9 +559,12 @@ python examples/plugin_cost_demo.py --mock --plain
 # 100% 可复现；末尾自带 SideEffectTracker.is_empty() 断言
 python examples/saga_demo.py --mock --plain
 
-# Phase 1 第一批：Compact 机制（9 段 Summary + Boundary + Transcript + project 投影）
+# Phase 1 第一批：Compact 机制（分级：snip tool_result → 滑窗 → 仍超才 LLM 9 段 Summary）
 # --mock 必触发 compact（第 4 轮 token=8500 > 8000），5 项断言全通过
 python examples/compact_demo.py --mock --plain
+
+# Durable Agent：崩溃后 resume，副作用工具只执行一次（幂等键短路）
+python examples/agent_resume_demo.py
 
 # Phase 1 第二批：Scope（per-key 隔离）
 # 3 项断言：同 key 串行 + 不同 key 并行 < 0.18s + state 写回跨 acquire 可见
@@ -627,7 +647,12 @@ assert ok, reasons
 Atlas/
 ├── atlas/                  # 核心源码
 │   ├── core/               # Agent 内核（9 原语 + compact + 幂等键 + Saga 补偿 + 熔断器 + 重试）
-│   │   ├── agent.py        # ReAct 循环：role_configs/tool_specs_pool/spawn_subagents 注入；compact_threshold + compact_manager + transcript 接入；幂等键 cache 命中跳过；SagaStack LIFO 补偿；Phase 2.2 工具执行段接入熔断器 allow_request + 重试循环；Phase 4.1 skill_library/failure_memory 参数 + inspect_self() + bind_agent 自动注入；Phase 4.2a propose_diff/self_evolve；Phase 4.2b evolve_prompt + generation 计数器；Phase 4.2b增强 evolve_prompt_until_converged/rollback_to
+│   │   ├── agent.py        # 薄封装：llm/tools/system_prompt/runtime；run() 返回 str；run_detailed()/resume()；bind_rsi()
+│   │   ├── runtime.py      # Runtime 组装面：journal 必选 + terminator/plugins/compact/circuit/permission/tracer
+│   │   ├── loop.py         # AgentLoop：durable 同步循环（checkpoint / saga 入 Journal / resume / 权限门控 / OTEL spans）
+│   │   ├── result.py       # RunResult(final_answer, run_id, status, events, suspend_token)
+│   │   ├── permission.py   # NeverConfirm / AlwaysConfirm / ConfirmRisky；高风险工具挂起 SuspendToken
+│   │   ├── tracer.py       # TracerProtocol + NoOpTracer + OtelTracer（atlas[otel] extras，未安装 no-op）
 │   │   ├── plugin.py       # PluginProtocol + PluginManager + BasePlugin（19 钩子 no-op 基类：基础 8 + Saga 3 + 熔断器 3 + 重试 3 + HITL 2 on_suspend/on_resume）
 │   │   ├── circuit_breaker.py # Phase 2.2 新增：CircuitBreakerRegistry 三态状态机（Closed→Open→Half-Open）+ threading.Lock 线程安全 + snapshot 快照
 │   │   ├── retry.py        # Phase 2.2 新增：full_jitter_delay_ms Full Jitter 退避 + sleep_ms
@@ -636,15 +661,16 @@ Atlas/
 │   │   ├── multi_agent.py  # 并行子 Agent 内核原语：RoleConfig/SubagentSpec/SubagentResult + parallel_gather（ThreadPoolExecutor + 渲染合并）+ make_spawn_subagents_tool
 │   │   ├── graph.py        # Phase 3.1 新增：Graph（解释器模式）+ Edge/ConditionalEdge + ParallelNode（fan_out+and_汇聚）+ GraphTrace/GraphResult + react_graph 桥接函数；Phase 3.2 扩展：GraphResult.status/suspend_token + Graph.resume() + suspend_timeout
 │   │   ├── suspend.py      # Phase 3.2 新增：SuspendToken(run_id, node_name, seq) + SuspendTimeout 异常 + SuspendNode(prompt_fn)（Graph 专用 HITL 节点）
-│   │   └── scope.py        # Phase 1 第二批：Scope（per-key threading.Lock + 内存 state + acquire(key) context manager）
+│   │   └── scope.py        # Phase 1 第二批：Scope（进程内 per-key threading.Lock + 内存 state；不跨进程）
 │   ├── journal/            # 执行日志 event sourcing
 │   │   ├── __init__.py     # re-export JournalProtocol/JournalEvent/InMemoryJournal/SQLiteJournal
-│   │   ├── base.py         # JournalProtocol(6 方法：append/get_events/replay/list_run_ids/cache_get/cache_set) + JournalEvent + InMemoryJournal（摘要模式默认 mask 敏感字段/截断 200 字，opt-in save_full_payload 全量）
-│   │   └── sqlite.py       # SQLite 持久化实现：默认 ./.atlas/journal.db（path 可覆盖，支持 :memory:）；2 表 events/cache；MAX(seq) 实时算 next_seq；check_same_thread=True + 单一 threading.Lock 全包读写；save_full_payload 行为与 InMemoryJournal 完全一致；对称实现 next_seq/make_event
+│   │   ├── base.py         # JournalProtocol（含 restore）+ InMemoryJournal；关键事件始终全量落盘
+│   │   ├── restore.py      # RunSnapshot + restore_from_events（messages / saga_stack / term_ctx / status）
+│   │   └── sqlite.py       # 默认 ./.atlas/journal.db；Agent 未传 journal 时默认此后端（save_full_payload=True）
 │   ├── utils/              # 工具函数（Phase 2.1 扩展：幂等键 + 副作用追踪器）
 │   │   ├── idempotency.py  # Phase 2.1 新增：derive_idempotency_key(run_id, tool_name, input) → SHA-1 40 位 + IDEMPOTENCY_USER_KEY='_idempotency_key' 常量
 │   │   ├── tracker.py      # Phase 2.1 新增：SideEffectTracker record/erase/is_empty 可观测 Saga 补偿覆盖度
-│   │   └── yaml_loader.py  # load_parallel_subagent_config()：YAML → RoleConfig + parent + task
+│   │   └── yaml_loader.py  # load_agent_config()（atlas run）+ load_parallel_subagent_config()
 │   ├── render/             # 渲染层：Protocol + PlainRenderer + RichRenderer
 │   │   ├── base.py         # Renderer Protocol（5 个方法）
 │   │   ├── plain.py        # 默认纯文本实现（零依赖）
@@ -662,11 +688,14 @@ Atlas/
 │   ├── context/            # 执行轨迹与上下文（Phase 1 扩 4 文件）
 │   │   ├── attachment.py   # Phase 1 新增：Attachment ABC + AttachmentRegistry（register/create 模式，重名 ValueError 拒绝）
 │   │   ├── transcript.py   # Phase 1 新增：Transcript append-only 事件存档 + JSONL 导出/恢复，与 Memory 双写
-│   │   ├── compact.py      # Phase 1 新增：CompactManager（9 段 Summary + should_compact 阈值判断 + LLM/规则双模式）
+│   │   ├── compact.py      # CompactManager：分级 snip → 滑窗 → LLM 9 段 Summary；略超阈值不调 LLM
 │   │   └── trace.py        # Trace + StepRecord + 三段式递归 render + subagent_traces 嵌套 + Trace.meta
+│   ├── testing/            # 测试专用 FakeLLM（不进顶层 __init__）
+│   │   └── fake_llm.py
 │   ├── cli/                # CLI 子命令
 │   │   ├── init.py         # atlas init：venv + 依赖安装 + .env 配置
-│   │   └── dashboard.py    # Phase 1 第二批 + Phase 2.2 增强：HTTP(8765)+WebSocket(8766) Dashboard + publish() 推送 API + RESILIENCE 横幅三表（熔断器/重试/告警）
+│   │   ├── run.py          # atlas run --config YAML [--resume run_id]
+│   │   └── dashboard.py    # HTTP(8765)+WebSocket(8766) Dashboard
 │   ├── patterns/           # Phase 2.3 新增：产品级多 Agent 模式包（独立于 atlas.core，仅组合内核原语）
 │   │   ├── __init__.py     # re-export PlannerWorkerCritic / PWCResult / PWCTrace / OrchestratorWorkers / OWResult / OWTrace（不进 atlas 顶层导出）
 │   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
@@ -676,7 +705,9 @@ Atlas/
 │   │   ├── __init__.py     # re-export 4.1 全部 + 4.2a PermissionLevel/check_permission/ArchivedProposal/ArchiveStore/ProposedDiff/EvaluationResult/propose_diff/evaluate/apply_diff/self_evolve + 4.2b FitnessEvaluator/FitnessResult/FakeFitnessEvaluator/TaskSetFitnessEvaluator/LeakageGuard/LeakageCheckResult/RegexLeakageGuard/EvolutionResult/evolve_prompt + 4.2b增强 EvolutionSummary/evolve_prompt_until_converged/rollback_to
 │   │   ├── embedding.py    # EmbeddingProtocol（embed/embed_batch/dimension）+ FakeEmbedding（MD5 hash 64 维确定性）+ OpenAIEmbedding（复用 LLM client）
 │   │   ├── vector_store.py # VectorStoreProtocol（add/query/get/delete/count）+ VectorHit + SQLiteVectorStore（bytes 存 SQLite + 纯 Python 余弦相似度）
-│   │   ├── skill.py        # Skill dataclass（name/description/code/embedding/version/fitness_score）+ SkillLibrary（register/retrieve/get/list_all/latest_version）+ to_tool()
+│   │   ├── skill.py        # Skill + SkillLibrary；to_tool() 走 subprocess 沙箱，禁止进程内 exec
+│   │   ├── sandbox.py      # 受限解释器：超时 + builtins 白名单
+│   │   ├── _sandbox_worker.py
 │   │   ├── failure.py      # FailureCase dataclass + FailureMemory（record/retrieve/list_recent）+ FailureMemoryCollector(BasePlugin)（挂 3 钩子 + weakref 读 Agent 上下文）
 │   │   ├── inspector.py    # SelfSnapshot dataclass（5 字段）+ build_self_snapshot(agent)
 │   │   ├── archive.py      # Phase 4.2a 新增：PermissionLevel 枚举（CORE/BUFFERED/FREE）+ check_permission() + ArchivedProposal（4.2b扩 generation 字段）+ ArchiveStore（add/list_recent/list_failed/list_passed/count + 4.2b扩 list_by_generation/get_passed_at）
@@ -684,9 +715,13 @@ Atlas/
 │   │   ├── fitness.py      # Phase 4.2b 新增：FitnessResult dataclass + FitnessEvaluator Protocol + FakeFitnessEvaluator（0.4/0.8/0.3 确定性序列）+ TaskSetFitnessEvaluator（真实接口预留骨架）
 │   │   └── prompt_evolver.py # Phase 4.2b 新增：LeakageCheckResult + LeakageGuard Protocol + RegexLeakageGuard（默认 ~10 中英文越狱模式 + extra_patterns）+ EvolutionResult + evolve_prompt（反思式变异闭环）+ 4.2b增强 EvolutionSummary（多代汇总三停止条件）+ evolve_prompt_until_converged（收敛/上限/无进展）+ rollback_to（按代回滚 system_prompt + generation）+ _build_evolution_prompt/_extract_fitness_history/_extract_archived_failures
 │   ├── providers.py        # LLM provider 预设表
-│   └── __main__.py         # CLI 入口：python -m atlas
+│   └── __main__.py         # CLI：python -m atlas {init,dashboard,run}
+├── tests/                  # pytest 内核回归（DR-0 / durable / permission / sandbox / compact / yaml）
+├── .github/workflows/ci.yml
 ├── examples/
-│   ├── quickstart.py       # 快速开始示例（支持 RichRenderer / --plain）
+│   ├── quickstart.py
+│   ├── quickstart.yaml     # atlas run 最小配置
+│   ├── agent_resume_demo.py # 崩溃恢复：幂等命中、副作用只执行一次
 │   ├── saga_demo.py        # Phase 2.1 新增：Saga 补偿完整流程（write_po + charge 成功 → ship FAIL-SHIP-500 → MaxSteps(3) 终止 → LIFO 补偿清零；SideEffectTracker 断言）
 │   ├── parallel_subagent_demo.py     # Phase 2-1 并行子 Agent demo（YAML 声明式配置，< 120 行，--config 可指定）
 │   ├── parallel_subagent_config.yaml # 声明式 Role + 父 Agent + 任务配置（被 yaml_loader 读取）
@@ -731,11 +766,11 @@ Atlas/
 **实现参考**：Journal / Scope / event sourcing 参考 **Edda**（纯 Python、内建 `@on_failure` Saga）和 **DBOS**（进程内库 + SQLite/Postgres）的内嵌式设计，不依赖外部 server；Compact / Transcript 三层拆分参考 **Claude Code** 和 **Pydantic AI v2** 已验证的实现模式。
 
 - [x] **Transcript 三层拆分（Transcript / Runtime / API messages）**—— Transcript（append-only 事件存档 + JSONL）/ Memory._runtime_messages（原始数据，含 isMeta）/ Memory.messages @property（project() 投影，返回干净的 API messages）
-- [x] **Compact 机制（Summary + Boundary + 状态重注入）**—— CompactManager；默认 threshold=8000；9 段结构化 Summary 复用 Agent LLM 生成；type=compact_summary + type=compact_boundary 消息对；Attachment 作为未来 state re-injection 载体已就绪
+- [x] **Compact 机制（分级 + Summary + Boundary + 状态重注入）**—— `CompactManager.apply()`：超阈值先 snip 过旧 tool_result，再滑窗，仍超才 LLM 9 段 Summary；compact 后 `AttachmentRegistry.rebuild_all(agent)` 从活状态重建 attachment
 - [x] **历史投影层 `project()`（找 Boundary → 过滤 → 转 attachment → 修配对 → 裁剪）**—— 五步流水线：找最后 compact_boundary → 保留 system prompt + Summary + Boundary 后消息 → isMeta 分层转换（Attachment→system / Summary→assistant / Boundary→跳过）→ tool_call 配对修复（删除断裂 tool_calls 和无配对 tool 消息）→ 超阈值裁剪最旧 user/assistant 对到 target=threshold×0.7
-- [x] **Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器**—— Attachment ABC + AttachmentRegistry（register/create 模式）；重名 ValueError 拒绝 + TypeError 子类校验；to_system_reminder() 子类覆写 + to_message() Runtime 消息生成；Memory.add_attachment() 便捷写入
-- [x] **Journal（执行日志，event sourcing 崩溃重放）**—— `InMemoryJournal` + `SQLiteJournal` 双后端（JournalProtocol 接口可插拔）；SQLite 持久化：默认 `./.atlas/journal.db`（path 可覆盖，支持 `:memory:` 临时），2 表 events/cache，`MAX(seq)` 实时算 next_seq，check_same_thread=True + 单一 `threading.Lock` 全包读写，无 WAL 不多文件；replay() 聚合与 InMemoryJournal 行为完全一致；摘要模式默认 mask 敏感字段 + 截断 200 字，`save_full_payload=True` opt-in 全量；journal_replay_demo 支持 `--journal-backend=sqlite` 同断言验证
-- [x] **Scope（按 key 隔离 Agent 实例）**—— `atlas.core.Scope` + `with scope.acquire(key) as ctx` context manager；per-key `_locks[key]` 懒创建（双 guard 锁防并发重复）+ `_states[key]` 内存 state 字典；SimpleNamespace (.key/.state) 模式；异常也释放锁并写回当前 state（不兜底回滚）；`get_state(key)` 返回只读拷贝；key 空/非 str → ValueError
+- [x] **Attachment 抽象基类 + 类型注册表 + 默认 system-reminder 转换器**—— Attachment ABC + AttachmentRegistry（register/create 模式）；重名 ValueError 拒绝 + TypeError 子类校验；to_system_reminder() 子类覆写 + to_message() Runtime 消息生成；Memory.add_attachment() 便捷写入；`rebuild_from_state` / `rebuild_all` 供 compact 后重注入
+- [x] **Journal（执行日志，event sourcing 崩溃重放）**—— `InMemoryJournal` + `SQLiteJournal`（JournalProtocol 可插拔）；默认 SQLite `./.atlas/journal.db`；**Agent 未注入 Journal 时 ValueError，省略则默认 SQLite 全量**；关键事件始终全量落盘；`restore(run_id) -> RunSnapshot` 重建 messages / saga_stack / term_ctx / status；`replay()` 仍为摘要 API。Postgres / Temporal **未做**
+- [x] **Scope（进程内按 key 隔离）**—— `atlas.core.Scope` + `with scope.acquire(key) as ctx`；per-key 锁 + 内存 state；**不跨进程、不跨机器**；`get_state(key)` 返回只读拷贝；key 空/非 str → ValueError
 - [x] **极简 Dashboard 骨架**—— `python -m atlas dashboard --port 8765`；HTTP ThreadingHTTPServer（8765，返回内嵌字符串 HTML 免路径问题）+ WebSocket asyncio（8766，每 500ms 广播 DATASTATE snapshot）；三面板（左 Run 列表 / 中 Trace DAG 卡片缩进 / 右 Events 类型着色）；`atlas.cli.dashboard.publish(run_id, journal, trace)` 全局推送（journal 聚合 run 状态 + trace 递归打平 nodes/edges）；前端自动重连 3s
 - [x] **终止条件组合器**（MaxSteps / Timeout / TokenBudget / CostCap / RepetitionDetector）—— `|` 运算符组合，`CompositeTerminator` 任一命中即终止；默认 `MaxSteps(10) | Timeout(60_000)` 与旧版完全兼容
 - [x] **插件体系（接入 Agent 全生命周期）**：`PluginProtocol` + `PluginManager` + `BasePlugin` 钩子基类（子类按需覆写 no-op）；10 个生命周期 + UUID run_id + 全链路 step_id；预置 `TokenCostPlugin` / `FileLoggerPlugin` 真实工作
@@ -827,7 +862,7 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 
 - [x] **EmbeddingProtocol + FakeEmbedding / OpenAIEmbedding**—— `atlas.rsi.EmbeddingProtocol`（embed / embed_batch / dimension）；FakeEmbedding MD5 hash → 64 维确定性向量（demo 可复现）；OpenAIEmbedding 复用 LLM client（text-embedding-3-small 1536 维）
 - [x] **VectorStoreProtocol + SQLiteVectorStore**—— 可插拔向量存储协议（add/query/get/delete/count）+ VectorHit(id, score, metadata)；默认 SQLiteVectorStore：bytes 存 SQLite + 纯 Python 余弦相似度 top-k（零外部依赖，不引入 Chroma）；threading.Lock 线程安全
-- [x] **Skill Library**—— `Skill(name, description, code, embedding, version, fitness_score)` dataclass 独立于 Tool；`SkillLibrary` register（自动 embed + 版本递增）/ retrieve（语义检索 top-k）/ get / list_all / latest_version；`to_tool()` exec(code) → Tool（打通 SkillLibrary 和 Toolkit）；4.1 不做 Critic 入库闸门
+- [x] **Skill Library**—— `Skill(name, description, code, embedding, version, fitness_score)` dataclass 独立于 Tool；`SkillLibrary` register（自动 embed + 版本递增）/ retrieve（语义检索 top-k）/ get / list_all / latest_version；`to_tool()` 走 subprocess 沙箱执行（禁止进程内 `exec`）
 - [x] **失败记忆**—— `FailureCase` dataclass + `FailureMemory`（record/retrieve/list_recent）+ `FailureMemoryCollector(BasePlugin)` 挂 on_tool_after_call(failed)/on_retry_exhausted/on_compensate_failed 三钩子实时采集；weakref 读 Agent 上下文构造 context_summary；Agent __init__ 自动 bind_agent 注入
 - [x] **inspect_self()**—— `Agent.inspect_self() -> SelfSnapshot`（system_prompt / tool_definitions / skill_summaries / recent_failures / memory_summary）；Agent 新增 skill_library + failure_memory 可选参数（None 默认，零侵入）
 - [x] **rsi_demo.py**—— 8 项断言全可复现：SkillLibrary register/retrieve/版本化/to_tool + FailureMemory record/retrieve + Collector Plugin + inspect_self 空值零侵入 + FakeEmbedding 确定性
@@ -858,15 +893,29 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 - [x] **V1 单步 + V2 demo 8 项 + V3 全回归**（19 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/dashboard/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/tool_abi/prompt_evolution）
 - [x] **FREE 层说明**—— 4.2b 实际在 BUFFERED 层（system_prompt 受控修改 + evaluate + leakage 门控），FREE 自由层沙箱留给未来工具自生成场景
 
+### 内核硬化（可用库，已完成）
+
+对照 DBOS / Pydantic AI / Claude Code / OpenHands，把内核从 demo 覆盖面改成可恢复、可组装、可测试、可一键跑。不引入 Temporal，不拆三包，不继续堆 RSI。
+
+- [x] **pytest + CI**—— `tests/` + `atlas.testing.FakeLLM`；GitHub Action 跑 `pytest tests -q` 与内核 demo `--mock --plain`
+- [x] **DR-0 导入方向测试**—— `atlas.llm` 不得 import `atlas.core` / `atlas.rsi` / `atlas.patterns`（单包内锁死，不拆三包）
+- [x] **Durable Agent 循环**—— Journal 必选；`Agent.run(task, run_id=None)` + `Agent.resume(run_id)`；Saga 入 Journal；崩溃后幂等短路，副作用只执行一次（`examples/agent_resume_demo.py`）
+- [x] **Runtime 组装面**—— `Runtime(journal, ...)`；Agent 构造优先 `llm/tools/system_prompt/runtime`；循环在 `AgentLoop`；RSI 走 `bind_rsi()`
+- [x] **工具门控**—— `NeverConfirm` / `AlwaysConfirm` / `ConfirmRisky`；高风险工具返回 `RunResult(status="suspended")`，`resume(token, {"approved": true|false})`
+- [x] **Skill 沙箱**—— `to_tool()` subprocess + 超时 + builtins 白名单；禁止进程内 `exec`，不回退
+- [x] **OTEL GenAI spans（opt-in）**—— `atlas[otel]` extras；未安装 no-op。`Trace` 仍给 Dashboard 投影
+- [x] **分级 Compact + Attachment 重注入**—— snip → 滑窗 → LLM Summary；compact 后从活状态重建 attachment
+- [x] **最小 CLI**—— `python -m atlas run --config examples/quickstart.yaml`；`--resume <run_id>` 续跑；库 API `RunResult`
+
 ### Phase 5：产品化与生态（规划中）
 
 Phase 4 完成了 RSI 自进化基础设施（感知层 + 修改层 + Prompt 进化 + 评估器），Phase 5 聚焦"从 demo 级到产品级"的跨越：端到端体验、真实场景验证、开发者生态。
 
 #### 5.1 端到端产品体验
 
-- [ ] **Atlas CLI 增强**—— `atlas run <task>` 一键跑通端到端（自动选 Agent 配置 + 加载工具 + 执行 + 输出结果）；`atlas evolve` 一键触发 Prompt 进化（指定任务集 + 评估器 + 代数，后台跑完输出最优 prompt + 进化报告）
+- [x] **Atlas CLI 最小入口**—— `python -m atlas run --config path.yaml` 组装 Runtime+Agent 并打印答案；`--resume <run_id>` 走 Journal 续跑。不做 `atlas evolve` / RSI 面板 / Marketplace
 - [ ] **Web UI 进化面板**—— Dashboard 扩展 RSI 面板：进化轨迹图（fitness 曲线 + 每代 diff 摘要）、回滚操作按钮、fitness 评估明细展开
-- [ ] **配置化 Agent 声明**—— YAML 声明式 Agent 配置（system_prompt + tools + skills + fitness_evaluator + evolution 参数），`atlas run --config agent.yaml` 直接加载
+- [x] **配置化 Agent 声明（最小）**—— YAML：`agent.system_prompt/tools/max_steps/compact_threshold` + `llm.provider/model` + `task`；缺字段 `RuntimeError`，不给静默默认。进化相关字段不在本入口
 - [ ] **进化报告导出**—— 进化完成后自动生成 Markdown 报告（初始 prompt → 每代改动 + fitness → 最终 prompt + 前后对比）
 
 #### 5.2 真实场景验证
@@ -889,9 +938,12 @@ Phase 4 完成了 RSI 自进化基础设施（感知层 + 修改层 + Prompt 进
 - 完全闭环 RSI（前沿实验室都没实现，治理问题非工程问题）
 - 控制流自修改 / 架构层自改写代码（Darwin Gödel Machine 式，Python 生态无工程化先例，代价过高）
 - TUI / 终端 UI（Atlas 是库不是终端产品）
-- 自建完整 durable execution runtime（做成可插拔后端，不自造）
+- Temporal / Restate / 外部 durable server（Journal 是进程内库，默认 SQLite）
+- 把仓库拆成 atlas-llm / atlas-core / atlas-agent 三包（用测试锁依赖方向）
+- Postgres Journal（Protocol 已在，等有多进程需求再做）
 - 在图编排上与 LangGraph 正面竞争（复杂编排场景直接集成 LangGraph/Pydantic AI）
 - 内置角色/SOP/Prompt（留给上层，内核只提供控制平面）
+- MkDocs 文档站点 / Skill Marketplace / GEPA 种群 / FREE 层架构自改
 
 ## 开发规则
 
@@ -899,13 +951,13 @@ Phase 4 完成了 RSI 自进化基础设施（感知层 + 修改层 + Prompt 进
 
 ### DR-0 依赖方向红线（对应 EP-2）
 
+单包 `atlas`，不拆三包。由 `tests/test_dr0_imports.py` 锁死：
+
 ```
-atlas-llm  严禁导入 atlas-core / atlas-agent
-atlas-core 严禁导入 atlas-agent
-atlas-agent 可以导入所有下层
+atlas.llm  严禁导入 atlas.core / atlas.rsi / atlas.patterns / atlas.cli
 ```
 
-违反此规则的代码不合并。
+违反此规则的代码不合并。RSI 不进默认 Agent 构造，按需 `bind_rsi()`；RSI 方法在 Agent 上延迟 import `atlas.rsi`。
 
 ### DR-1 接口先行（对应 EP-2）
 
@@ -981,13 +1033,14 @@ Dashboard 严禁引入 npm / React / Vue / Webpack 等前端工具链。允许�
 
 - Protocol 后缀：`xxxProtocol`（如 `JournalProtocol`），不用 `Ixxx` 前缀
 - 具体实现：`<特性><Protocol名>`（如 `SQLiteJournal`、`ChromaSkillLibrary`）
-- CLI 子命令：全小写 + 短横线（`atlas init`、`atlas dashboard`）
+- CLI 子命令：全小写 + 短横线（`atlas init`、`atlas dashboard`、`atlas run`）
 - 日志事件名：点分隔（`saga.step.execute`、`dashboard.run.start`）
 
 ## 贡献
 
 欢迎通过 Issue 提交问题与建议，或通过 Pull Request 贡献代码。提交前请确保：
 
+- `python -m pytest tests -q` 通过
 - 代码风格一致，注释使用中文
 - 新增能力有对应示例
 - 不引入破坏性 fallback（消除 fallback 触发场景，而非加更多兜底）

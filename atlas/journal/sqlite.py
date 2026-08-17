@@ -134,7 +134,9 @@ class SQLiteJournal:
 
         与 InMemoryJournal 行为完全一致（copy 自 base.py InMemoryJournal.append）。
         """
-        if not self.save_full_payload:
+        from .base import _should_store_full
+
+        if not _should_store_full(event.event_type, self.save_full_payload):
             event = JournalEvent(
                 run_id=event.run_id,
                 seq=event.seq,
@@ -174,30 +176,29 @@ class SQLiteJournal:
             ))
         return out
 
-    def replay(self, run_id: str) -> dict:
-        """重放指定 run 的事件，返回状态摘要。
+    def restore(self, run_id: str):
+        """从事件重建 RunSnapshot。"""
+        from .restore import restore_from_events
 
-        逻辑与 InMemoryJournal.replay 完全一致（copy 再改写 base.py L136-L161）。
-        """
+        return restore_from_events(self.get_events(run_id))
+
+    def replay(self, run_id: str) -> dict:
+        """重放指定 run 的事件，返回状态摘要。"""
         events = self.get_events(run_id)
         if not events:
             return {"run_id": run_id, "event_count": 0, "status": "not_found"}
 
+        snap = self.restore(run_id)
         type_counts: dict[str, int] = {}
-        final_result = None
-        status = "running"
         for e in events:
             type_counts[e.event_type] = type_counts.get(e.event_type, 0) + 1
-            if e.event_type == "agent_finish":
-                final_result = e.payload.get("final_result")
-                status = e.payload.get("status", "finished")
 
         return {
             "run_id": run_id,
             "event_count": len(events),
             "type_counts": type_counts,
-            "status": status,
-            "final_result": final_result,
+            "status": snap.status,
+            "final_result": snap.final_result,
         }
 
     def list_run_ids(self) -> list[str]:

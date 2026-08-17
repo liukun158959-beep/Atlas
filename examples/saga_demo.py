@@ -62,7 +62,7 @@ class SagaFakeLLM:
     def __init__(self) -> None:
         self._call = 0
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, on_delta=None):
         self._call += 1
         if self._call == 1:
             tool_calls = [

@@ -83,7 +83,7 @@ class WalkthroughFakeLLM(LLM):
             "duration_ms": 8,
         }
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         self._call_count += 1
         self._record(messages)
         n = self._call_count

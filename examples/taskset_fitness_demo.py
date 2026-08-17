@@ -44,7 +44,7 @@ class TaskSetFakeLLM(LLM):
     # 记录收到的 system_prompt（用于判断返回质量）
     _current_system_prompt: str = ""
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         # 从 messages[0] 读取 system_prompt
         if messages and messages[0].get("role") == "system":
             self._current_system_prompt = messages[0].get("content", "")

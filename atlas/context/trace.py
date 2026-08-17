@@ -31,7 +31,7 @@ class StepRecord:
             renderer.markdown(self.thought)
         for i, call in enumerate(self.tool_calls):
             fn = call.get("function", {}) or {}
-            action_line = f"▶ 调用工具  {fn.get('name')}"
+            action_line = f"> 调用工具  {fn.get('name')}"
             arg = fn.get("arguments")
             obs = self.observations[i] if i < len(self.observations) else None
             # meta 显示 arguments

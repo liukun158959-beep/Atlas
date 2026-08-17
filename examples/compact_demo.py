@@ -43,7 +43,7 @@ class CompactFakeLLM:
             ("第五轮回复（compact 后）：基于之前的摘要继续工作。", 3000),
         ]
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         # 检测是否是 compact 调用（CompactManager 的 system prompt）
         first_msg = messages[0] if messages else {}
         if "对话摘要助手" in first_msg.get("content", ""):

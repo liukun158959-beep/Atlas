@@ -28,7 +28,7 @@ class CostlyFakeLLM:
         self.model = "qwen-plus"  # TokenCostPlugin 按此名查价格表
         self._call = 0
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, on_delta=None):
         self._call += 1
         msg = {
             "role": "assistant", "content": f"第 {self._call} 轮思考",

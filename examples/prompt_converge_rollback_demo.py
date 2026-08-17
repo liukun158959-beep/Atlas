@@ -93,7 +93,7 @@ class ConvergeRollbackFakeLLM(LLM):
     model: str = "mock-converge-rollback"
     _call_count: int = 0
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         self._call_count += 1
         current_sys = messages[0].get("content", "") if messages else ""
         # 提议：在当前 prompt 末尾加 "专业。"

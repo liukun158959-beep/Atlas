@@ -3,11 +3,7 @@
 当前子命令：
     init       项目初始化（创建 venv + 安装依赖 + 配置 .env）
     dashboard  启动极简 Dashboard（HTTP + WebSocket 实时面板）
-
-用法：
-    python -m atlas init
-    python -m atlas dashboard           # 默认 HTTP=8765, WS=8766
-    python -m atlas dashboard --port 9000
+    run        从 YAML 配置运行 / resume Agent
 """
 from __future__ import annotations
 
@@ -42,6 +38,10 @@ def _print_usage() -> int:
     print("  init       项目初始化（创建 venv + 安装依赖 + 配置 .env）")
     print("  dashboard  启动极简 Dashboard（HTTP + WebSocket 实时面板）")
     print("                --port <int>   HTTP 端口 (默认 8765，WebSocket = port + 1)")
+    print("  run        从 YAML 运行 Agent")
+    print("                --config <path>   配置文件（必需）")
+    print("                --resume <run_id> 从 Journal 续跑")
+    print("                --plain           纯文本输出")
     return 1
 
 
@@ -63,6 +63,11 @@ def main() -> int:
         port = _parse_port(sub_argv, 8765)
         run_server(http_port=port)
         return 0
+
+    if command == "run":
+        from .cli.run import run as run_cmd
+
+        return run_cmd(sub_argv)
 
     print(f"未知子命令: {command}")
     return _print_usage()

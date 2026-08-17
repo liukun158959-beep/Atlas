@@ -65,7 +65,7 @@ class PromptEvolutionFakeLLM(LLM):
     # 记录每次 propose 收到的 prompt（用于断言 ③ 反思式变异）
     _received_prompts: list[str] = field(default_factory=list)
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         self._call_count += 1
         # 记录 propose 收到的 user prompt（用于断言 ③）
         for m in messages:

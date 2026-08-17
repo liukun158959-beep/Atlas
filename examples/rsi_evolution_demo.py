@@ -87,7 +87,7 @@ class EvolveFakeLLM(LLM):
     _propose_count: int = 0
     last_user_prompt: str = ""  # 捕获最近一次 user prompt（断言⑦用）
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         self._step += 1
         sys_msg = messages[0].get("content", "") if messages else ""
         user_prompt = messages[1].get("content", "") if len(messages) > 1 else ""

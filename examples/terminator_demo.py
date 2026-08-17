@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import sys
-import time
 
 from atlas.core.agent import Agent
 from atlas.core.terminator import (
@@ -21,29 +20,9 @@ from atlas.core.terminator import (
     make_default_terminator,
 )
 from atlas.render import PlainRenderer, RichRenderer
+from atlas.testing import LoopingFakeLLM
 from atlas.tools.base import Toolkit
 from atlas.tools.builtin import BUILTIN_TOOLS
-
-
-class LoopingFakeLLM:
-    """总是返回 tool_calls 的假 LLM，让 Agent 持续循环以触发终止条件。"""
-
-    def __init__(self, sleep_ms: int = 0, content: str = "正在计算...") -> None:
-        self.model = "fake"
-        self._sleep_ms = sleep_ms
-        self._content = content
-
-    def chat(self, messages, tools=None):
-        if self._sleep_ms:
-            time.sleep(self._sleep_ms / 1000.0)
-        msg = {
-            "role": "assistant", "content": self._content,
-            "tool_calls": [{
-                "id": "tc1", "type": "function",
-                "function": {"name": "calculator", "arguments": '{"expression": "1+1"}'},
-            }],
-        }
-        return {"message": msg, "usage": None, "duration_ms": self._sleep_ms}
 
 
 def main() -> None:

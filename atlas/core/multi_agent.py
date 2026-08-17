@@ -111,11 +111,12 @@ def _run_subagent(spec: SubagentSpec, agent_ref: "Agent") -> SubagentResult:
         tools=sub_toolkit,
         system_prompt=role_cfg.system_prompt + (spec.extra_system_prompt or ""),
         max_steps=role_cfg.max_steps,
-        renderer=type(agent_ref.renderer)(),   # Q20：同类型新实例（Rich→Rich，Plain→Plain）
-        role_configs=agent_ref.role_configs,  # 传是传了，但 _inject_spawn_tool 会快速返回
-        parent_trace=agent_ref.trace,          # → 嵌套守卫第一道：子 Agent 标记为有父
-        auto_inject_spawn_tool=False,          # → 嵌套守卫第二道：双保险
+        renderer=type(agent_ref.renderer)(),
+        role_configs=agent_ref.role_configs,
+        parent_trace=agent_ref.trace,
+        auto_inject_spawn_tool=False,
         tool_specs_pool=agent_ref.tool_specs_pool,
+        journal=agent_ref.journal,
     )
 
     # ------------------------------------------------------------------

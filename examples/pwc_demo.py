@@ -58,7 +58,7 @@ class PWCFakeLLM(LLM):
     model: str = "mock-pwc"
     _step: int = 0
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         self._step += 1
         s = self._step
 

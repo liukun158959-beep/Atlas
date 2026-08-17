@@ -4,13 +4,17 @@
 - 公共字段（run_id/seq/ts/event_type）是强类型 dataclass
 - payload 是自由 dict，按 event_type 约定 key
 
-存储范围：默认摘要模式（save_full_payload=False），opt-in 全量模式。
+关键恢复事件始终全量落盘；其余事件在 save_full_payload=False 时摘要。
+restore(run_id) 重建 RunSnapshot；replay() 仍为摘要 API。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from .restore import RunSnapshot
 
 
 @dataclass
@@ -52,6 +56,10 @@ class JournalProtocol(Protocol):
         """按幂等键写缓存值（覆盖写）。"""
         ...
 
+    def restore(self, run_id: str) -> Any:
+        """从事件重建 RunSnapshot（Memory / saga / 终止上下文）。"""
+        ...
+
 
 def _now_iso() -> str:
     """返回当前 UTC 时间的 ISO 8601 字符串。"""
@@ -86,6 +94,13 @@ def _summarize_value(val, depth: int = 0) -> object:
     return val
 
 
+def _should_store_full(event_type: str, save_full_payload: bool) -> bool:
+    """关键恢复事件始终全量落盘；其余事件尊重 save_full_payload。"""
+    from .restore import CRITICAL_EVENT_TYPES
+
+    return save_full_payload or event_type in CRITICAL_EVENT_TYPES
+
+
 def _summarize_payload(event_type: str, payload: dict) -> dict:
     """摘要模式：mask 敏感字段 + 截断长文本。"""
     return _summarize_value(payload)  # 走 dict 分支，执行 key 检查
@@ -110,8 +125,8 @@ class InMemoryJournal:
         self._cache[key] = value
 
     def append(self, event: JournalEvent) -> None:
-        """追加事件。若 save_full_payload=False，自动摘要 payload。"""
-        if not self.save_full_payload:
+        """追加事件。关键恢复事件始终全量；其余在 save_full_payload=False 时摘要。"""
+        if not _should_store_full(event.event_type, self.save_full_payload):
             event = JournalEvent(
                 run_id=event.run_id,
                 seq=event.seq,
@@ -133,31 +148,29 @@ class InMemoryJournal:
             key=lambda e: e.seq,
         )
 
-    def replay(self, run_id: str) -> dict:
-        """重放指定 run 的事件，返回状态摘要。
+    def restore(self, run_id: str) -> "RunSnapshot":
+        """从事件重建 RunSnapshot。"""
+        from .restore import restore_from_events
 
-        当前实现：聚合事件类型计数 + 最后一个 agent_finish 的 final_result。
-        后续可扩展为完整状态重建。
-        """
+        return restore_from_events(self.get_events(run_id))
+
+    def replay(self, run_id: str) -> dict:
+        """重放指定 run 的事件，返回状态摘要（兼容旧 demo）。"""
         events = self.get_events(run_id)
         if not events:
             return {"run_id": run_id, "event_count": 0, "status": "not_found"}
 
+        snap = self.restore(run_id)
         type_counts: dict[str, int] = {}
-        final_result = None
-        status = "running"
         for e in events:
             type_counts[e.event_type] = type_counts.get(e.event_type, 0) + 1
-            if e.event_type == "agent_finish":
-                final_result = e.payload.get("final_result")
-                status = e.payload.get("status", "finished")
 
         return {
             "run_id": run_id,
             "event_count": len(events),
             "type_counts": type_counts,
-            "status": status,
-            "final_result": final_result,
+            "status": snap.status,
+            "final_result": snap.final_result,
         }
 
     def list_run_ids(self) -> list[str]:

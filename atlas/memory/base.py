@@ -99,6 +99,13 @@ class Memory:
     # ------------------------------------------------------------------
     # 清空
     # ------------------------------------------------------------------
+    def load_runtime_messages(self, messages: list[dict]) -> None:
+        """用 Journal 恢复的消息替换运行时历史。"""
+        self._runtime_messages = [dict(m) for m in messages]
+
+    def replace_runtime_messages(self, messages: list[dict]) -> None:
+        self.load_runtime_messages(messages)
+
     def clear(self) -> None:
         """清空对话历史，保留 system prompt。"""
         self._runtime_messages = [

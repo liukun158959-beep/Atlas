@@ -45,25 +45,88 @@ class LLM:
             base_url=base_url or os.getenv("ATLAS_BASE_URL") or preset.get("base_url"),
         )
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        on_delta: Any | None = None,
+    ) -> dict:
         """调用对话接口，返回 {message, usage, duration_ms}。
 
-        - message: assistant 消息 dict（可直接存入 memory）
-        - usage: token 用量 dict（prompt_tokens/completion_tokens/total_tokens），可能为 None
-        - duration_ms: 本次调用耗时（毫秒）
+        on_delta:
+            若传入，则走 stream=True，每段 content 回调一次。
+            tool_calls 只在内部拼完整，不回调（避免把 JSON 当说话内容）。
         """
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
         start_ts = time.time()
-        response = self.client.chat.completions.create(**kwargs)
-        duration_ms = int((time.time() - start_ts) * 1000)
-        message = response.choices[0].message.model_dump(exclude_none=True)
+        if on_delta is None:
+            response = self.client.chat.completions.create(**kwargs)
+            duration_ms = int((time.time() - start_ts) * 1000)
+            message = response.choices[0].message.model_dump(exclude_none=True)
+            usage = None
+            if hasattr(response, "usage") and response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                }
+            return {"message": message, "usage": usage, "duration_ms": duration_ms}
+        return self._chat_stream(kwargs, on_delta, start_ts)
+
+    def _chat_stream(
+        self,
+        kwargs: dict[str, Any],
+        on_delta: Any,
+        start_ts: float,
+    ) -> dict:
+        stream = self.client.chat.completions.create(
+            **kwargs,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        content_parts: list[str] = []
+        tool_acc: dict[int, dict] = {}
         usage = None
-        if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
+        for chunk in stream:
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage:
+                usage = {
+                    "prompt_tokens": chunk_usage.prompt_tokens,
+                    "completion_tokens": chunk_usage.completion_tokens,
+                    "total_tokens": chunk_usage.total_tokens,
+                }
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            piece = getattr(delta, "content", None)
+            if piece:
+                content_parts.append(piece)
+                on_delta(piece)
+            for call in getattr(delta, "tool_calls", None) or []:
+                slot = tool_acc.setdefault(
+                    call.index,
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if call.id:
+                    slot["id"] = call.id
+                fn = call.function
+                if fn is None:
+                    continue
+                if fn.name:
+                    slot["function"]["name"] += fn.name
+                if fn.arguments:
+                    slot["function"]["arguments"] += fn.arguments
+        duration_ms = int((time.time() - start_ts) * 1000)
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts) or None,
+        }
+        if tool_acc:
+            message["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc)]
         return {"message": message, "usage": usage, "duration_ms": duration_ms}

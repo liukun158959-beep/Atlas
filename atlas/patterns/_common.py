@@ -48,6 +48,9 @@ def _make_agent(
     """
     renderer = shared_renderer or PlainRenderer()
     terminator = shared_terminator or make_default_terminator(max_steps)
+    kwargs: dict[str, Any] = {}
+    if shared_journal is not None:
+        kwargs["journal"] = shared_journal
     return Agent(
         llm=llm,
         tools=tools,
@@ -55,16 +58,16 @@ def _make_agent(
         max_steps=max_steps,
         renderer=renderer,
         terminator=terminator,
-        plugin_manager=shared_plugin_manager,  # None 时 Agent 内部自动造空 PluginManager
-        journal=shared_journal,  # None 时不记录事件
-        role_configs=role_configs,  # Worker/Critic = None，Planner 透传
-        parent_trace=None,  # PWC 的 Planner/Worker/Critic 都是顶层 new Agent（无嵌套守卫）
+        plugin_manager=shared_plugin_manager,
+        role_configs=role_configs,
+        parent_trace=None,
         auto_inject_spawn_tool=auto_inject_spawn_tool,
         tool_specs_pool=None,
         compact_threshold=compact_threshold,
-        transcript=None,  # Agent 默认自建 Transcript
-        circuit_breaker_registry=shared_circuit_breaker_registry,  # None 时 Agent 自动造空 Registry
+        transcript=None,
+        circuit_breaker_registry=shared_circuit_breaker_registry,
         auto_default_registry=(shared_circuit_breaker_registry is None),
+        **kwargs,
     )
 
 

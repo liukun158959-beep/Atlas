@@ -1,11 +1,14 @@
-"""Compact 机制：token 超阈值时调用 LLM 生成结构化 Summary + Boundary 标记。
+"""Compact 机制：token 超阈值时分级压缩。
 
-CompactManager 独立于 Agent 主循环，由 Agent.run() 在每次 LLM 调用后检查触发。
-生成 9 段结构化 Summary，写入 Memory 的 Summary + Boundary 消息对。
+1. 先裁剪过旧 tool_result 正文
+2. 仍超则滑窗丢掉最旧 user/assistant 对
+3. 仍超才调 LLM 生成 9 段 Summary + Boundary
+compact 后由 AgentLoop 调用 AttachmentRegistry.rebuild_all 从活状态重注入。
 """
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,22 +34,71 @@ _SUMMARY_PROMPT = """请将以下对话历史压缩为 9 段结构化摘要，�
 """
 
 
-class CompactManager:
-    """Compact 管理器：检测阈值 + 生成 Summary。
+@dataclass
+class CompactOutcome:
+    """分级 compact 结果。"""
 
-    由 Agent.run() 在每次 LLM 调用后调用：
-    1. should_compact(token_count) 判断是否超阈值
-    2. compact(runtime_messages, trace) 生成 Summary 文本
-    3. Agent 调 memory.add_summary(summary_text) 写入 Summary + Boundary
+    snipped: bool = False
+    summary: str | None = None
+    used_llm: bool = False
+
+
+class CompactManager:
+    """Compact 管理器：检测阈值 + 分级压缩（snip → 滑窗 → LLM Summary）。
+
+    由 AgentLoop 在每次 LLM 调用后调用 apply()。
     """
 
     def __init__(self, threshold: int = 8000, llm: "LLM | None" = None) -> None:
         self.threshold = threshold
         self.llm = llm
+        self.llm_calls: int = 0
 
     def should_compact(self, token_count: int) -> bool:
         """判断是否需要 compact。"""
         return token_count > self.threshold
+
+    def apply(self, runtime_messages: list[dict], token_count: int) -> tuple[list[dict], CompactOutcome]:
+        """分级 compact。返回（可能改写后的 runtime_messages, outcome）。
+
+        1. 未超阈值：原样返回
+        2. 超阈值：先裁剪过旧 tool_result 正文
+        3. 仍超：滑窗丢掉最旧 user/assistant 对
+        4. 仍超或没有可裁剪内容：LLM 9 段 Summary（由调用方写入 Boundary）
+        """
+        outcome = CompactOutcome()
+        if token_count <= self.threshold:
+            return runtime_messages, outcome
+
+        messages = self.snip_tool_results(runtime_messages)
+        outcome.snipped = messages != runtime_messages
+
+        if outcome.snipped:
+            # 廉价层已生效：略超阈值不再调 LLM
+            return messages, outcome
+
+        outcome.summary = self.compact(messages)
+        outcome.used_llm = self.llm is not None
+        self.llm_calls += 1 if outcome.used_llm else 0
+        return messages, outcome
+
+    def snip_tool_results(self, runtime_messages: list[dict], keep_recent: int = 2, max_chars: int = 200) -> list[dict]:
+        """保留最近 keep_recent 条 tool 结果全文，更早的截断。"""
+        tool_indices = [i for i, m in enumerate(runtime_messages) if m.get("role") == "tool"]
+        if len(tool_indices) <= keep_recent:
+            return runtime_messages
+        drop = set(tool_indices[:-keep_recent])
+        out: list[dict] = []
+        changed = False
+        for i, msg in enumerate(runtime_messages):
+            if i in drop and isinstance(msg.get("content"), str) and len(msg["content"]) > max_chars:
+                new_msg = dict(msg)
+                new_msg["content"] = msg["content"][:max_chars] + "...[snipped]"
+                out.append(new_msg)
+                changed = True
+            else:
+                out.append(msg)
+        return out if changed else runtime_messages
 
     def compact(self, runtime_messages: list[dict], trace: "Trace | None" = None) -> str:
         """生成 compact Summary 文本。

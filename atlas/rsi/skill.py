@@ -1,10 +1,6 @@
 """Skill Library：代码即数据的技能注册/检索/版本化。
 
-Q4=B：新建 Skill dataclass（独立于 Tool，含 code/description/embedding/version/fitness_score）
-Q6=A：SkillLibrary API register / retrieve / get / list_all / latest_version
-Q12=A：code 存完整 def 语句字符串（可 exec() 执行）
-Q13=A：4.1 不做 Critic 验证（register 直接入库）
-Q18=A：to_tool() exec(code) → 提取同名函数 → 包装成 Tool
+to_tool() 经 subprocess 沙箱执行 skill code，禁止进程内 exec。
 """
 from __future__ import annotations
 
@@ -32,25 +28,19 @@ class Skill:
     metadata: dict = field(default_factory=dict)
 
     def to_tool(self) -> Tool:
-        """将 Skill 的 code 字符串 exec 为函数，包装成 Tool。
+        """将 Skill code 包装成 Tool；执行走 subprocess 沙箱，禁止进程内 exec。"""
+        from .sandbox import run_skill_in_sandbox
 
-        exec 在用户主动调用时触发（非自动执行），安全风险可控。
-        Phase 4.2 的沙箱权限模型会包裹 exec。
-        """
-        namespace: dict[str, Any] = {}
-        exec(self.code, namespace)
-        # code 是 "def xxx(...): ..."，exec 后 namespace 中有同名函数
-        func = None
-        for v in namespace.values():
-            if callable(v) and getattr(v, "__name__", None) == self.name:
-                func = v
-                break
-        if func is None:
-            raise ValueError(f"Skill code 中未找到名为 {self.name} 的函数")
+        code = self.code
+        func_name = self.name
+
+        def _sandboxed(args: dict) -> str:
+            return run_skill_in_sandbox(code, func_name, args)
+
         return Tool(
             name=self.name,
             description=self.description,
-            func=func,
+            func=_sandboxed,
             parameters=self.metadata.get("parameters", {"type": "object", "properties": {}}),
         )
 

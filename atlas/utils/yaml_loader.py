@@ -67,6 +67,28 @@ def load_parallel_subagent_config(
     return roles, parent_cfg, task
 
 
+def load_agent_config(path: str) -> dict[str, Any]:
+    """读取最小 Agent YAML：agent / llm / task 均为必需。缺字段 RuntimeError。"""
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"YAML 配置根节点必须是映射，实际类型: {type(raw).__name__}"
+        )
+    agent_cfg = _require(raw, "agent")
+    llm_cfg = _require(raw, "llm")
+    task = _require(raw, "task")
+    _require(agent_cfg, "system_prompt", where="agent")
+    _require(agent_cfg, "tools", where="agent")
+    _require(llm_cfg, "provider", where="llm")
+    _require(llm_cfg, "model", where="llm")
+    return {
+        "agent": agent_cfg,
+        "llm": llm_cfg,
+        "task": task,
+        "journal": raw.get("journal") or {},
+    }
+
+
 def _require(container: Any, key: str, where: str = "") -> Any:
     """从 container 取必需字段，缺失时抛 RuntimeError 带具体字段名。"""
     if not isinstance(container, dict) or key not in container:

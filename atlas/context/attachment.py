@@ -58,3 +58,15 @@ class AttachmentRegistry:
     def list_types(self) -> list[str]:
         """列出所有已注册的类型名。"""
         return list(self._types.keys())
+
+    def rebuild_all(self, agent: Any) -> list[Attachment]:
+        """compact 后从活状态重建 Attachment，不复用旧 isMeta 消息。"""
+        rebuilt: list[Attachment] = []
+        for cls in self._types.values():
+            fn = getattr(cls, "rebuild_from_state", None)
+            if fn is None:
+                continue
+            inst = fn(agent)
+            if inst is not None:
+                rebuilt.append(inst)
+        return rebuilt

@@ -5,6 +5,14 @@
 - SQLiteJournal：SQLite 持久化版（默认 ./.atlas/journal.db，崩溃可重放）
 """
 from .base import InMemoryJournal, JournalEvent, JournalProtocol
+from .restore import RunSnapshot, restore_from_events
 from .sqlite import SQLiteJournal
 
-__all__ = ["JournalProtocol", "JournalEvent", "InMemoryJournal", "SQLiteJournal"]
+__all__ = [
+    "JournalProtocol",
+    "JournalEvent",
+    "InMemoryJournal",
+    "SQLiteJournal",
+    "RunSnapshot",
+    "restore_from_events",
+]

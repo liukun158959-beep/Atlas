@@ -63,7 +63,7 @@ class OWFakeLLM(LLM):
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_delta=None) -> dict:
         # 从 messages 中提取 system 消息
         system_msg = ""
         for m in messages:

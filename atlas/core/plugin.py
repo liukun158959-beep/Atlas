@@ -338,6 +338,10 @@ class BasePlugin:
     def on_llm_after_call(self, *, run_id: str, turn_idx: int, model: str, response: dict[str, Any], usage: dict[str, int] | None, duration_ms: int) -> None:
         pass
 
+    def on_llm_delta(self, *, run_id: str, turn_idx: int, delta: str) -> None:
+        """流式正文增量。默认忽略；不要把每字写入 Journal。"""
+        pass
+
     def on_tool_before_call(self, *, run_id: str, turn_idx: int, step_id: str, tool_name: str, input: dict[str, Any]) -> None:
         pass
 

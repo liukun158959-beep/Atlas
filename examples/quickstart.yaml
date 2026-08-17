@@ -1,0 +1,11 @@
+agent:
+  system_prompt: "你是通用助手 Atlas，遇到需要计算或获取时间的问题请主动调用工具。"
+  tools:
+    - calculator
+    - get_current_time
+  max_steps: 10
+  compact_threshold: 8000
+llm:
+  provider: qwen
+  model: qwen-plus
+task: "先告诉我现在几点，然后计算 365 * 24 等于多少"
