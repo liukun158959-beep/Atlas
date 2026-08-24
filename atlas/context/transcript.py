@@ -26,7 +26,11 @@ class Transcript:
         self._events: list[dict[str, Any]] = []
 
     def append(self, event: dict) -> None:
-        """追加一条消息事件（不修改、不裁剪）。"""
+        """追加一条消息事件（不修改、不裁剪）。
+
+        Args:
+            event: 通常是写入 Memory 的那条消息 dict。
+        """
         self._events.append(event)
 
     def replay(self) -> list[dict]:
@@ -37,14 +41,22 @@ class Transcript:
         return len(self._events)
 
     def to_jsonl(self, path: str) -> None:
-        """导出为 JSONL 文件（每行一个 JSON 对象）。"""
+        """导出为 JSONL。
+
+        Args:
+            path: 文件路径。
+        """
         with open(path, "w", encoding="utf-8") as f:
             for event in self._events:
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     @classmethod
     def from_jsonl(cls, path: str) -> "Transcript":
-        """从 JSONL 文件恢复 Transcript 实例。"""
+        """从 JSONL 恢复。
+
+        Args:
+            path: ``to_jsonl`` 写出的文件。
+        """
         transcript = cls()
         with open(path, "r", encoding="utf-8") as f:
             for line in f:

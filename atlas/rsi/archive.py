@@ -23,10 +23,13 @@ _BUFFERED_TARGETS = {"skill", "system_prompt"}
 
 
 def check_permission(target_type: str) -> PermissionLevel:
-    """检查 target_type 的权限层级。
+    """判断提案目标属于哪一层权限。
 
-    核心层（graph/agent/tool/plugin 等）只读——propose_diff 不可修改。
-    缓冲层（skill/system_prompt）受控——propose_diff 可修改，但必须经 evaluate 通过。
+    Args:
+        target_type: 如 skill / system_prompt / graph。
+
+    Returns:
+        BUFFERED 可经 evaluate 后改；CORE 只读。
     """
     if target_type in _BUFFERED_TARGETS:
         return PermissionLevel.BUFFERED
@@ -63,7 +66,10 @@ class ArchiveStore:
     ) -> None:
         """归档一条提案（含评估结果）。
 
-        generation: apply 成功时传 agent.generation（进化代），失败时不传（-1 默认）。
+        Args:
+            proposal: ``ProposedDiff``。
+            evaluation: ``EvaluationResult``。
+            generation: apply 成功时传 ``agent.generation``；失败默认 -1。
         """
         self._archive.append(ArchivedProposal(
             proposal=proposal,

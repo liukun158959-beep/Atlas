@@ -53,9 +53,18 @@ class LLM:
     ) -> dict:
         """调用对话接口，返回 {message, usage, duration_ms}。
 
-        on_delta:
-            若传入，则走 stream=True，每段 content 回调一次。
-            tool_calls 只在内部拼完整，不回调（避免把 JSON 当说话内容）。
+        Args:
+            messages: OpenAI 格式消息列表（通常来自 ``Memory.messages``）。
+            tools: OpenAI tools schema；None 表示不传工具。
+            on_delta: 若传入则 stream=True，每段 content 回调一次；
+                tool_calls 只在内部拼完整。
+
+        Returns:
+            dict：message / usage（可能 None）/ duration_ms。
+
+        依赖:
+            OpenAI 兼容 HTTP；流式时 ``stream_options.include_usage``。
+            由 ``AgentLoop`` 与 RSI ``propose_diff`` / ``evolve_prompt`` 调用。
         """
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
         if tools:

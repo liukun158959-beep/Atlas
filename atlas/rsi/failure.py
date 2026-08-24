@@ -54,7 +54,17 @@ class FailureMemory:
         self._counter = 0
 
     def record(self, case: FailureCase) -> str:
-        """记录一条失败案例，返回 case_id。"""
+        """记录一条失败案例。
+
+        Args:
+            case: 失败上下文；embedding 空则用 context_summary 现算。
+
+        Returns:
+            case_id。
+
+        依赖:
+            ``EmbeddingProtocol``、``VectorStoreProtocol.add``。
+        """
         if case.created_at == 0.0:
             case.created_at = time.time()
 
@@ -75,7 +85,12 @@ class FailureMemory:
         return case_id
 
     def retrieve(self, query: str, top_k: int = 5) -> list[FailureCase]:
-        """语义检索：query 文本 -> embedding -> VectorStore top_k -> 返回 FailureCase 列表。"""
+        """按上下文语义检索失败案例。
+
+        Args:
+            query: 查询文本。
+            top_k: 条数。
+        """
         query_emb = self._embedding.embed(query)
         hits = self._vs.query(query_emb, top_k)
         results: list[FailureCase] = []

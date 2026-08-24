@@ -8,10 +8,18 @@ IDEMPOTENCY_USER_KEY = "_idempotency_key"  # 用户显式传幂等键的字段�
 
 
 def derive(run_id: str, tool_name: str, input_dict: dict) -> str:
-    """稳定派生幂等键。
+    """从 run + 工具 + 输入稳定派生幂等键（SHA-1 hex）。
 
-    用 sort_keys 的 JSON 序列化消除 dict key 顺序歧义，
-    用 run_id\ntool_name\nserialized_input 拼接后 SHA-1 输出 40 字符十六进制。
+    Args:
+        run_id: 当前运行。
+        tool_name: 工具名。
+        input_dict: 工具入参（会 sort_keys JSON）。
+
+    Returns:
+        40 位十六进制。用户也可在 input 里显式传 ``_idempotency_key``。
+
+    依赖:
+        由 ``AgentLoop`` 在副作用工具执行前调用，配合 ``Journal.cache_get``。
     """
     serialized = json.dumps(input_dict, sort_keys=True, ensure_ascii=False)
     payload = f"{run_id}\n{tool_name}\n{serialized}"

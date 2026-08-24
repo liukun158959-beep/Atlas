@@ -55,16 +55,25 @@ class CompactManager:
         self.llm_calls: int = 0
 
     def should_compact(self, token_count: int) -> bool:
-        """判断是否需要 compact。"""
+        """是否超过 compact 阈值。
+
+        Args:
+            token_count: 当前 prompt tokens。
+        """
         return token_count > self.threshold
 
     def apply(self, runtime_messages: list[dict], token_count: int) -> tuple[list[dict], CompactOutcome]:
         """分级 compact。返回（可能改写后的 runtime_messages, outcome）。
 
-        1. 未超阈值：原样返回
-        2. 超阈值：先裁剪过旧 tool_result 正文
-        3. 仍超：滑窗丢掉最旧 user/assistant 对
-        4. 仍超或没有可裁剪内容：LLM 9 段 Summary（由调用方写入 Boundary）
+        Args:
+            runtime_messages: ``Memory.runtime_messages``。
+            token_count: 当前 prompt tokens。
+
+        Returns:
+            新消息列表与 ``CompactOutcome``（是否 snip / 是否需要 LLM summary）。
+
+        依赖:
+            可选 ``LLM.chat``（最后一档 Summary）；由 ``AgentLoop`` 调用后写 Boundary。
         """
         outcome = CompactOutcome()
         if token_count <= self.threshold:

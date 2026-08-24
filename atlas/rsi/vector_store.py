@@ -28,13 +28,27 @@ class VectorHit:
 
 @runtime_checkable
 class VectorStoreProtocol(Protocol):
-    """向量存储协议。"""
+    """向量存储协议（Skill / 失败记忆检索）。"""
 
-    def add(self, id: str, embedding: list[float], metadata: dict) -> None: ...
-    def query(self, embedding: list[float], top_k: int = 5) -> list[VectorHit]: ...
-    def get(self, id: str) -> VectorHit | None: ...
-    def delete(self, id: str) -> None: ...
-    def count(self) -> int: ...
+    def add(self, id: str, embedding: list[float], metadata: dict) -> None:
+        """写入一条向量。"""
+        ...
+
+    def query(self, embedding: list[float], top_k: int = 5) -> list[VectorHit]:
+        """按余弦相似度取 top_k。"""
+        ...
+
+    def get(self, id: str) -> VectorHit | None:
+        """按 id 精确取。"""
+        ...
+
+    def delete(self, id: str) -> None:
+        """删除一条。"""
+        ...
+
+    def count(self) -> int:
+        """条数。"""
+        ...
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:

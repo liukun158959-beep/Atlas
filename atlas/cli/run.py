@@ -13,6 +13,18 @@ from atlas.utils.yaml_loader import load_agent_config
 
 
 def build_agent_from_config(config: dict, *, plain: bool = False) -> Agent:
+    """从 ``load_agent_config`` 的 dict 组装 Agent。
+
+    Args:
+        config: 含 agent / llm / task，可选 journal.path。
+        plain: True 用 PlainRenderer。
+
+    Returns:
+        已接 SQLiteJournal 的 Agent。
+
+    依赖:
+        ``LLM``、``Toolkit`` + ``BUILTIN_TOOLS``、``SQLiteJournal``、``Agent``。
+    """
     llm_cfg = config["llm"]
     agent_cfg = config["agent"]
     llm = LLM(
@@ -43,6 +55,17 @@ def build_agent_from_config(config: dict, *, plain: bool = False) -> Agent:
 
 
 def run(argv: list[str]) -> int:
+    """``python -m atlas run`` 入口：跑 YAML 任务或 ``--resume``。
+
+    Args:
+        argv: 子命令参数（不含 ``run`` 本身）。
+
+    Returns:
+        进程退出码；success/terminated/suspended 为 0。
+
+    依赖:
+        ``load_agent_config``、``Agent.run_detailed`` / ``resume_detailed``。
+    """
     import argparse
 
     from dotenv import load_dotenv

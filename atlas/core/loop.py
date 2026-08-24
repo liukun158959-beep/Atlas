@@ -19,12 +19,31 @@ if TYPE_CHECKING:
 
 
 class AgentLoop:
-    """同步 Agent 循环。崩溃后用同一 Journal + resume(run_id) 续跑。"""
+    """同步 Durable Agent 循环：LLM / 工具 / Journal checkpoint / resume。
+
+    不直接给用户用；``Agent.run`` / ``resume`` 委托到这里。
+
+    依赖:
+        ``LLM.chat``、``Toolkit``、``JournalProtocol``、``PermissionPolicy``、
+        ``CircuitBreakerRegistry``、``Terminator``、``PluginManager``。
+    """
 
     def __init__(self, agent: "Agent") -> None:
+        """Args:
+            agent: 已组装好的 Agent（必须带 runtime.journal）。
+        """
         self.agent = agent
 
     def run(self, user_input: str, run_id: str | None = None) -> RunResult:
+        """从用户输入开跑，事件写入 Journal。
+
+        Args:
+            user_input: 本轮任务。
+            run_id: 省略则新建 UUID。
+
+        Returns:
+            ``RunResult``（success / terminated / suspended）。
+        """
         agent = self.agent
         run_id = run_id or str(uuid.uuid4())
         agent.trace.meta["run_id"] = run_id
@@ -61,6 +80,18 @@ class AgentLoop:
             )
 
     def resume(self, run_id: str, user_input: dict | None = None) -> RunResult:
+        """从 Journal 快照续跑；已成功/已终止则直接返回当时答案。
+
+        Args:
+            run_id: Journal 中的运行 id。
+            user_input: 挂起恢复时注入，如 ``{"approved": True}``。
+
+        Returns:
+            ``RunResult``。找不到记录则 ValueError。
+
+        依赖:
+            ``JournalProtocol.restore``、``Memory.load_runtime_messages``。
+        """
         agent = self.agent
         journal = agent.journal
         snap = journal.restore(run_id)

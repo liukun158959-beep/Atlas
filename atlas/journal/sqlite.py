@@ -177,7 +177,14 @@ class SQLiteJournal:
         return out
 
     def restore(self, run_id: str):
-        """从事件重建 RunSnapshot。"""
+        """从事件重建 RunSnapshot。
+
+        Args:
+            run_id: 运行 id。
+
+        依赖:
+            ``restore_from_events``。
+        """
         from .restore import restore_from_events
 
         return restore_from_events(self.get_events(run_id))

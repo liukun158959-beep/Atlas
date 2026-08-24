@@ -26,7 +26,11 @@ if TYPE_CHECKING:  # 避免循环导入
 
 @dataclass
 class RoleConfig:
-    """子 Agent 角色声明式配置。"""
+    """子 Agent 角色：prompt、可用工具名、步数与超时。
+
+    依赖:
+        由 ``Agent.register_role`` 注入；``make_spawn_subagents_tool`` 按 name 查找。
+    """
 
     name: str
     system_prompt: str
@@ -191,12 +195,17 @@ def parallel_gather(
     specs: list[SubagentSpec],
     agent_ref: "Agent",
 ) -> list[SubagentResult]:
-    """并行执行多个子 Agent。
+    """并行跑多个子 Agent，返回顺序与 specs 一致，允许部分失败。
 
-    关键保证（🔴可行性审查修正）：
-    - 顺序保持：返回 list 顺序与输入 specs 严格一致（用 enumerate(idx) O(1) 回填而非 .index）
-    - partial success：任一个子 Agent 失败/超时，不影响其他；对应 error/schema_error 字段有值
-    - 并行效率：子 Agent.meta 写入 parallel_efficiency_ratio（实际耗时 / 累计子耗时）
+    Args:
+        specs: 子任务列表。
+        agent_ref: 父 Agent（提供 llm / role_configs / tool_specs_pool）。
+
+    Returns:
+        与 specs 等长的 ``SubagentResult`` 列表。
+
+    依赖:
+        ``_run_subagent`` → 再构造子 ``Agent``（不注入 spawn_subagents）。
     """
     if not specs:
         return []
@@ -263,11 +272,16 @@ def parallel_gather(
 
 
 def make_spawn_subagents_tool(agent: "Agent"):
-    """闭包工厂：生成供 Toolkit 注入的 spawn_subagents 工具四元组。
+    """生成父 Agent 可注册的 spawn_subagents 工具四元组。
 
-    返回: (name: str, description: str, parameters_factory: Callable[[], dict], func: Callable)
-    - parameters_factory 是 Q19 schema 懒加载：每次调用读 agent.role_configs.keys() 生成 enum
-    - func 内部做 Q17 嵌套守卫（用 getattr 防御性读取，Step 1 阶段 Trace 可能还没 _parent_trace）
+    Args:
+        agent: 父 Agent（读 role_configs，禁止嵌套 spawn）。
+
+    Returns:
+        (name, description, parameters_factory, func)。
+
+    依赖:
+        ``parallel_gather``、``RoleConfig``。
     """
 
     def _func(args: dict) -> str:

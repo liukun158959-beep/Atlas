@@ -28,7 +28,14 @@ class FitnessEvaluator(Protocol):
     """适应度评估协议：给 system prompt 打分。"""
 
     def evaluate(self, prompt: str) -> FitnessResult:
-        """评估 prompt 质量，返回 FitnessResult。"""
+        """给候选 system_prompt 打分。
+
+        Args:
+            prompt: 待评估文本。
+
+        Returns:
+            score 0~1、feedback、可选 task_results。
+        """
         ...
 
 

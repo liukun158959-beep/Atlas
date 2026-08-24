@@ -166,11 +166,16 @@ class OrchestratorWorkers:
     # 外部 API
     # -----------------------------------------------
     def run(self, task: str | None = None) -> OWResult:
-        """运行完整 OW 流程。task 若传则覆盖构造函数 task 字段。
+        """跑完 Orchestrator 动态分派 + 并行 Worker。
 
-        返回 OWResult(final_answer, trace)。
+        Args:
+            task: 覆盖构造时的任务。
 
-        流程：Python while 循环 -> 每轮 Orchestrator LLM 决策 -> dispatch(并行 Worker) / synthesize(汇总)
+        Returns:
+            ``OWResult(final_answer, trace)``。
+
+        依赖:
+            ``Agent`` / ``LLM``；Worker 经 ThreadPoolExecutor。
         """
         run_task = task or self.task
         if not run_task:

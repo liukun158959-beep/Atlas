@@ -402,9 +402,10 @@ class PluginManager:
     # ------------------------------------------------------------------
 
     def register(self, plugin: PluginProtocol) -> None:
-        """注册插件，按 priority 升序排序（小的先执行）。
+        """注册插件，按 priority 升序；同名禁止。
 
-        遵循 DR-6：同名插件禁止重复注册。
+        Args:
+            plugin: 实现 ``PluginProtocol`` 的实例。
         """
         if not isinstance(plugin, PluginProtocol):
             raise TypeError(
@@ -435,17 +436,14 @@ class PluginManager:
     # ------------------------------------------------------------------
 
     def emit(self, event: str, **kwargs: Any) -> None:
-        """派发事件给所有插件。
+        """按名调用插件 ``on_{event}``；单个插件异常只记日志。
 
-        Parameters
-        ----------
-        event:
-            事件名（如 "agent_start"、"llm_after_call"），
-            会自动映射到 "on_{event}" 方法名。
-        **kwargs:
-            结构化关键字参数，会原封不动传给插件方法。
+        Args:
+            event: 如 agent_start、llm_after_call。
+            **kwargs: 原样传给钩子。
 
-        遵循 DR-5：所有派发异常都记结构化日志，绝不中断主流程。
+        依赖:
+            ``PluginProtocol``；由 ``Agent._emit_and_journal`` / 熔断器调用。
         """
         handler_name = f"on_{event}"
         for plugin in self._plugins:

@@ -26,6 +26,14 @@ class Terminator(Protocol):
         ...
 
     def should_stop(self, ctx: SimpleNamespace) -> tuple[bool, list[str]]:
+        """检查是否应停止。
+
+        Args:
+            ctx: 含 step_count / start_time / total_tokens / cost_usd / recent_outputs。
+
+        Returns:
+            (是否停, 理由列表)。
+        """
         ...
 
 
@@ -141,6 +149,14 @@ class CompositeTerminator:
 def make_default_terminator(max_steps: int = 10, timeout_ms: int = 60_000) -> CompositeTerminator:
     """生成默认终止条件：MaxSteps | Timeout。
 
-    与旧版行为完全兼容（max_steps=10 保留），新增 timeout=60s 兜底。
+    Args:
+        max_steps: 循环步数上限。
+        timeout_ms: 墙钟超时毫秒。
+
+    Returns:
+        ``CompositeTerminator``。
+
+    依赖:
+        ``MaxSteps``、``Timeout``；由 Agent 无 runtime 时注入 Runtime.terminator。
     """
     return MaxSteps(max_steps) | Timeout(timeout_ms)

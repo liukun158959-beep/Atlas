@@ -145,14 +145,16 @@ def _build_evaluate_prompt(proposal: ProposedDiff, test_result: str | None) -> s
 # =============================================================
 
 def propose_diff(agent: Any) -> ProposedDiff:
-    """调 LLM 生成自进化提案。
+    """调 LLM 生成对 skill 或 system_prompt 的修改提案（不生效）。
 
-    流程：
-        1. build_self_snapshot(agent) 读取当前状态
-        2. 从 agent.archive_store 读取失败提案摘要（避免重复提议）
-        3. 调 agent.llm.chat 生成 JSON 提案
-        4. 权限校验（target_type 必须 BUFFERED，CORE 直接 PermissionError）
-        5. 返回 ProposedDiff
+    Args:
+        agent: 已 ``bind_rsi`` 的 Agent。
+
+    Returns:
+        ``ProposedDiff``。CORE 目标会 PermissionError。
+
+    依赖:
+        ``build_self_snapshot``、``LLM.chat``、``check_permission``、``ArchiveStore.list_failed``。
     """
     snapshot = build_self_snapshot(agent)
 
@@ -207,9 +209,17 @@ def propose_diff(agent: Any) -> ProposedDiff:
 
 
 def evaluate(agent: Any, proposal: ProposedDiff) -> EvaluationResult:
-    """双层评估：测试执行（仅 skill）+ LLM Critic。
+    """双层评估：skill 先 exec 测可用性，通过后再 LLM Critic。
 
-    测试失败直接拒绝，不调 LLM Critic。
+    Args:
+        agent: 提供 ``llm``。
+        proposal: ``propose_diff`` 产出。
+
+    Returns:
+        ``EvaluationResult``；测试失败不调 LLM。
+
+    依赖:
+        ``_test_skill_code``、``LLM.chat``。
     """
     test_result: str | None = None
 
@@ -253,10 +263,14 @@ def evaluate(agent: Any, proposal: ProposedDiff) -> EvaluationResult:
 
 
 def apply_diff(agent: Any, proposal: ProposedDiff) -> None:
-    """应用提案：skill 新版本入库 / system_prompt 替换。
+    """应用已通过的提案：skill 升版本入库，或替换 system 消息。
 
-    Q9=A：skill 新版本入库 version 递增（SkillLibrary.register 自动处理）。
-    Q18=A：system_prompt 替换前验证 role==system，只替换 content，不清空历史。
+    Args:
+        agent: 需有 skill_library 或 Memory。
+        proposal: 已评估通过的提案。
+
+    依赖:
+        ``SkillLibrary.register`` 或 ``Memory.runtime_messages[0]``。
     """
     if proposal.target_type == "skill":
         skill_library = getattr(agent, "skill_library", None)
@@ -284,16 +298,17 @@ def apply_diff(agent: Any, proposal: ProposedDiff) -> None:
 
 
 def self_evolve(agent: Any, archive_store: Any = None) -> EvaluationResult:
-    """闭环函数：propose → evaluate → apply/archive。
+    """propose → evaluate → apply/archive 一次。
 
-    流程：
-        1. propose_diff(agent) 生成提案
-        2. evaluate(agent, proposal) 评估
-        3. passed → apply_diff(agent, proposal) 应用
-        4. archive_store.add(proposal, evaluation) 归档（无论通过与否）
+    Args:
+        agent: 已绑定 RSI 的 Agent。
+        archive_store: 省略则用 ``agent.archive_store``。
 
-    archive_store 为 None 时从 agent.archive_store 读取。
-    返回 EvaluationResult。
+    Returns:
+        ``EvaluationResult``。
+
+    依赖:
+        ``propose_diff``、``evaluate``、``apply_diff``、``ArchiveStore.add``。
     """
     if archive_store is None:
         archive_store = getattr(agent, "archive_store", None)

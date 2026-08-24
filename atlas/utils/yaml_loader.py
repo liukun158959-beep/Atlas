@@ -68,7 +68,17 @@ def load_parallel_subagent_config(
 
 
 def load_agent_config(path: str) -> dict[str, Any]:
-    """读取最小 Agent YAML：agent / llm / task 均为必需。缺字段 RuntimeError。"""
+    """读取最小 Agent YAML：agent / llm / task 均为必需。
+
+    Args:
+        path: YAML 路径。
+
+    Returns:
+        原始配置 dict。缺字段 ``RuntimeError``。
+
+    依赖:
+        PyYAML；由 ``atlas.cli.run`` 调用。
+    """
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise RuntimeError(

@@ -32,7 +32,10 @@ class Evaluator(Protocol):
             contracts: 临时覆盖的契约列表，不传就用实例化时传入的
 
         Returns:
-            (是否通过, 未通过原因列表（空列表=通过）)
+            (是否通过, 未通过原因列表（空列表=通过）)。
+
+        依赖:
+            ``JournalEvent``（只读 events，不改 Journal）；实现侧常用 jsonschema。
         """
         ...
 
@@ -55,6 +58,16 @@ class ArtifactSchemaEvaluator:
         events: list[JournalEvent],
         contracts: list[tuple[str, dict]] | None = None,
     ) -> tuple[bool, list[str]]:
+        """按 JSON Schema 校验 result 里的 artifact。
+
+        Args:
+            result: Agent 最终文本，须能 ``json.loads``。
+            events: 未使用，保留与 Protocol 对齐。
+            contracts: 临时覆盖实例上的契约。
+
+        Returns:
+            (通过?, 失败原因)。无契约视为通过。
+        """
         contracts = contracts or self.contracts
         reasons: list[str] = []
         # 1. 没有契约 → 直接通过（Evaluator 是 opt-in 校验）

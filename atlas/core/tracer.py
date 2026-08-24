@@ -7,7 +7,15 @@ from typing import Any, Iterator, Protocol, runtime_checkable
 
 @runtime_checkable
 class TracerProtocol(Protocol):
+    """可选 tracing 后端。未装 OTEL 时用 ``NoOpTracer``。"""
+
     def span(self, name: str, attributes: dict[str, Any] | None = None) -> Any:
+        """打开一个 span（context manager）。
+
+        Args:
+            name: span 名，如 ``gen_ai.invoke_agent``。
+            attributes: 可选键值。
+        """
         ...
 
 
@@ -16,6 +24,7 @@ class NoOpTracer:
 
     @contextmanager
     def span(self, name: str, attributes: dict[str, Any] | None = None) -> Iterator[None]:
+        """空操作 span，yield None。"""
         yield None
 
 
@@ -33,6 +42,11 @@ class OtelTracer:
 
     @contextmanager
     def span(self, name: str, attributes: dict[str, Any] | None = None) -> Iterator[Any]:
+        """打开 OpenTelemetry span。
+
+        依赖:
+            ``opentelemetry.trace``（``atlas[otel]`` extras）。
+        """
         with self._tracer.start_as_current_span(name) as span:
             if attributes:
                 for k, v in attributes.items():

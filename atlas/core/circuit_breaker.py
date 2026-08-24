@@ -76,7 +76,15 @@ class CircuitBreakerRegistry:
     ) -> tuple[bool, str | None, str | None]:
         """请求是否放行。
 
-        返回值：(是否放行 bool, 放行后当前状态 str|None, 说明/拒绝原因 str|None)
+        Args:
+            circuit_key: 熔断隔离键（常为 tool.circuit_key 或工具名）。
+            run_id: 可选，写入插件事件。
+
+        Returns:
+            (是否放行, 放行后状态, 拒绝原因)。
+
+        依赖:
+            可选 ``PluginManager.emit``（circuit_half_open 等）。
         """
         with self._lock:
             s = self._get(circuit_key)
@@ -112,7 +120,12 @@ class CircuitBreakerRegistry:
             return (True, CLOSED, None)
 
     def on_success(self, circuit_key: str, run_id: str | None = None) -> None:
-        """请求成功回调（清零失败计数 / Half-Open 探测成功恢复 CLOSED）。"""
+        """记一次成功：CLOSED 清零失败；Half-Open 探测成功则回到 CLOSED。
+
+        Args:
+            circuit_key: 隔离键。
+            run_id: 可选，写入插件事件。
+        """
         with self._lock:
             s = self._get(circuit_key)
             now = time.time()
@@ -137,7 +150,12 @@ class CircuitBreakerRegistry:
                 s.last_state_change_ts = now
 
     def on_failure(self, circuit_key: str, run_id: str | None = None) -> None:
-        """请求失败回调（计数 / 触发熔断 / Half-Open 探测失败回 Open）。"""
+        """记一次失败：计数达阈值则 Open；Half-Open 探测失败则重新 Open。
+
+        Args:
+            circuit_key: 隔离键。
+            run_id: 可选。
+        """
         with self._lock:
             s = self._get(circuit_key)
             now = time.time()
@@ -183,7 +201,7 @@ class CircuitBreakerRegistry:
     # ------------------------------------------------------------------
 
     def snapshot(self) -> dict[str, list[dict]]:
-        """返回 Dashboard 所需的三块数据：circuit_breakers / retry_logs / alerts。"""
+        """给 Dashboard 的熔断器 / 重试日志 / 告警快照。"""
         with self._lock:
             now = time.time()
             circuit_rows: list[dict] = []

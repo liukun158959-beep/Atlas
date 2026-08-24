@@ -14,9 +14,16 @@ from typing import Any, Iterator
 
 
 class Scope:
-    """按 key 隔离 Agent 执行的作用域（进程内实现）。"""
+    """按 key 隔离执行的进程内作用域：同 key 串行，跨 key 并行。
+
+    不跨进程、不跨机器。状态只在 ``acquire`` 持锁期间可写。
+
+    依赖:
+        标准库 threading；不依赖 Journal。
+    """
 
     def __init__(self) -> None:
+        """创建空的锁表与状态表。"""
         self._locks: dict[str, threading.Lock] = {}
         self._states: dict[str, dict[str, Any]] = {}
         self._guards: dict[str, threading.Lock] = {
@@ -33,7 +40,11 @@ class Scope:
             return self._locks[key]
 
     def get_state(self, key: str) -> dict[str, Any]:
-        """读取指定 key 的 state（非持有锁时调用，返回拷贝，防止外部直接改内部 dict）。"""
+        """读取指定 key 的 state 拷贝（不持业务锁）。
+
+        Args:
+            key: 隔离键。
+        """
         guard = self._guards["states"]
         with guard:
             return dict(self._states.get(key, {}))
@@ -48,12 +59,11 @@ class Scope:
     def acquire(self, key: str) -> Iterator[SimpleNamespace]:
         """获取指定 key 的作用域（阻塞直到拿到锁）。
 
-        返回 SimpleNamespace（.key + .state），.state 是可变 dict，退出 __exit__ 时自动写回。
+        Args:
+            key: 非空字符串。
 
-        用法:
-            scope = Scope()
-            with scope.acquire("user-1") as ctx:
-                ctx.state["last_run_at"] = time.time()
+        Yields:
+            SimpleNamespace（.key + .state）；退出时写回 state。
         """
         if not isinstance(key, str) or not key:
             raise ValueError("scope key 必须是非空字符串")

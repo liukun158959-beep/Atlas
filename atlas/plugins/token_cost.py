@@ -165,7 +165,17 @@ class TokenCostPlugin(BasePlugin):
     # ---- 便捷查询 API（测试/断言用） -----------------------------------
 
     def get_summary(self, run_id: str | None = None) -> dict[str, Any]:
-        """获取指定 run_id 的汇总（或全局累计）。"""
+        """读取某次 run 或全局累计的 token / 成本。
+
+        Args:
+            run_id: 指定则只看该 run；None 看全局。
+
+        Returns:
+            含 input_tokens / output_tokens / total_tokens / cost_usd 等。
+
+        依赖:
+            ``on_llm_after_call`` 累计的 per_run；桌宠用量也读这个。
+        """
         if run_id is not None:
             s = self.per_run.get(run_id, {})
             return {

@@ -22,6 +22,7 @@ CRITICAL_EVENT_TYPES = frozenset({
 
 @dataclass
 class RunSnapshot:
+    """Journal 恢复出的运行快照，供 AgentLoop.resume 灌回 Memory / saga。"""
     run_id: str
     status: str = "not_found"
     task: str | None = None
@@ -37,7 +38,17 @@ class RunSnapshot:
 
 
 def restore_from_events(events: list[JournalEvent]) -> RunSnapshot:
-    """按 seq 重放。遇到 state_checkpoint 覆盖快照，其后事件继续叠加。"""
+    """按 seq 重放事件，得到可 resume 的快照。
+
+    Args:
+        events: 同一 run_id 的事件，须已按 seq 排好或可无序（函数按列表顺序扫）。
+
+    Returns:
+        ``RunSnapshot``；空列表则 status=not_found。
+
+    依赖:
+        ``JournalEvent``；由 ``InMemoryJournal.restore`` / ``SQLiteJournal.restore`` 调用。
+    """
     if not events:
         return RunSnapshot(run_id="", status="not_found")
 

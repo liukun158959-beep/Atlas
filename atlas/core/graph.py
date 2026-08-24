@@ -115,11 +115,14 @@ class GraphResult:
 # parallel_run 辅助（Q14=B）
 # =============================================================
 def parallel_run(fns: list[Callable[[dict], dict]], state: dict) -> list[dict]:
-    """并行执行多个节点函数，fail-fast 错误传播。
+    """并行跑多个节点函数，fail-fast。
 
-    每个 fn 收到同一份 state 的深拷贝（防互相污染）。
-    返回结果列表，顺序与 fns 一致（不是完成顺序）。
-    任一 fn 抛异常 -> 取消所有未完成的 + raise（不静默吞错，DR-8）。
+    Args:
+        fns: 每个收到 state 深拷贝。
+        state: 当前图状态。
+
+    Returns:
+        与 fns 同序的输出 dict 列表。任一抛错则取消其余并 raise。
     """
     results: list[dict | None] = [None] * len(fns)
     with ThreadPoolExecutor(max_workers=len(fns)) as pool:
@@ -140,9 +143,10 @@ def parallel_run(fns: list[Callable[[dict], dict]], state: dict) -> list[dict]:
 # =============================================================
 @dataclass
 class Graph:
-    """工作流图（解释器模式，Q2=A）。
+    """工作流图解释器：节点 + 普通/条件边 + 可选 Suspend/Parallel。
 
-    构造函数字段：0 必填 + 8 可选 = 8 项（<= DR-2 15 限额）。
+    依赖:
+        可选 ``JournalProtocol``（HITL 必选）、``PluginManager``、``Terminator``。
     """
 
     # ── 可选（8 项） ──
@@ -172,7 +176,12 @@ class Graph:
     # 命令式构造 API（Q9=A，和 LangGraph 对齐）
     # =============================================================
     def add_node(self, name: str, fn: Callable[[dict], dict]) -> None:
-        """注册节点。name 重名 ValueError（不静默覆盖，DR-0 红线）。"""
+        """注册节点。重名或名为 END 则 ValueError。
+
+        Args:
+            name: 节点名。
+            fn: ``state -> state 增量 dict``，解释器会 ``state.update``。
+        """
         if name in self._nodes:
             raise ValueError(f"节点 {name} 已存在，不可重复注册")
         if name == END:
@@ -180,7 +189,12 @@ class Graph:
         self._nodes[name] = fn
 
     def add_edge(self, from_node: str, to_node: str) -> None:
-        """加普通边。add 时不验证节点存在性（Q22=A lazy 验证留到 run）。"""
+        """加无条件边。节点是否存在留到 ``run`` 再验。
+
+        Args:
+            from_node: 起点。
+            to_node: 终点，可用保留字 END。
+        """
         self._edges.append(Edge(from_node=from_node, to_node=to_node))
 
     def add_conditional_edges(
@@ -189,7 +203,13 @@ class Graph:
         condition: Callable[[dict], str],
         mapping: dict[str, str],
     ) -> None:
-        """加条件边。condition 返回的 key 必须在 mapping 里，mapping 值是目标节点名或 END。"""
+        """加条件边。
+
+        Args:
+            from_node: 起点。
+            condition: ``state -> mapping 的 key``。
+            mapping: key → 目标节点名或 END。
+        """
         self._edges.append(ConditionalEdge(
             from_node=from_node,
             condition=condition,
@@ -197,11 +217,19 @@ class Graph:
         ))
 
     def set_entry_point(self, name: str) -> None:
-        """设置入口节点。"""
+        """设置入口节点。
+
+        Args:
+            name: 已规划的节点名（run 时再验是否注册）。
+        """
         self._entry_point = name
 
     def set_exit_point(self, name: str) -> None:
-        """标记退出节点（到该节点时停止）。多个 exit_point 用 set 保存。"""
+        """标记额外退出节点（执行到该节点即停）。
+
+        Args:
+            name: 节点名。
+        """
         self._exit_points.add(name)
 
     # =============================================================
@@ -242,13 +270,17 @@ class Graph:
         *,
         suspend_timeout: float | None = None,
     ) -> GraphResult:
-        """运行图（Phase 3.2 新增 suspend_timeout 预留参数，当前不阻塞线程）。
+        """从入口跑到 END / 挂起 / 终止。
 
-        流程：
-          1. _validate() 验证图结构
-          2. 从 entry_point 开始
-          3. 循环：执行节点 → 记录 Trace + 可选 Journal 事件 → 判断出边 → 路由
-          4. 终止：到 END / max_iterations / terminator / error / SuspendNode 挂起
+        Args:
+            initial_state: 初始 dict，缺省空 dict。
+            suspend_timeout: 预留，当前不阻塞等待。
+
+        Returns:
+            ``GraphResult``（completed 或 suspended）。
+
+        依赖:
+            ``JournalProtocol``（SuspendNode 时必选）、``PluginManager``、``Terminator``。
         """
         self._validate()
         state: dict = dict(initial_state or {})
@@ -264,16 +296,17 @@ class Graph:
         )
 
     def resume(self, token: SuspendToken, user_input: dict) -> GraphResult:
-        """从挂起点恢复执行（Q7=A + Q14=A）。
+        """从挂起点恢复；不重跑 SuspendNode，从下一条边继续。
 
-        流程：
-          1. 校验 user_input 是 dict（Q13=(2)B merge 语义）
-          2. 从 journal.get_events(token.run_id) 找 seq=token.seq 且 event_type=graph_suspend 的事件
-          3. 取事件 payload 的完整 state_snapshot（Q12=A + Q8=C 挂起点存完整快照）
-          4. state.update(user_input) 注入外部输入
-          5. append graph_resume 事件（审计链路 Q11=A）
-          6. emit on_resume 钩子（Q15=B）
-          7. 从 token.node_name 的下一条边开始路由（挂起节点不重跑 Q14=A）
+        Args:
+            token: ``run`` 返回的 ``suspend_token``。
+            user_input: 必须是 dict，merge 进当时的 state 快照。
+
+        Returns:
+            ``GraphResult``。
+
+        依赖:
+            ``JournalProtocol.get_events`` / ``append``。
         """
         if not isinstance(user_input, dict):
             raise ValueError(
@@ -648,6 +681,9 @@ class ParallelNode:
     """
 
     def __init__(self, fns: list[Callable[[dict], dict]]) -> None:
+        """Args:
+            fns: 至少一个 ``state -> dict``；并行跑完写入 ``parallel_results``。
+        """
         if not fns:
             raise ValueError("ParallelNode 至少需要 1 个 fn")
         self.fns = fns
@@ -662,12 +698,17 @@ class ParallelNode:
 # react_graph 桥接函数（Q8=C）
 # =============================================================
 def react_graph(agent: "Agent", max_iterations: int = 10) -> Graph:
-    """把 Agent 包装成单节点 Graph（Q8=C 桥接函数）。
+    """把 Agent 包成单节点 Graph（验证循环能用图语法表达）。
 
-    验证"Agent 循环能用 Graph 语法表达"设计假设。
-    最小形态：单节点 Graph（agent.run(state['input']) -> {'answer': ...}），无循环。
+    Args:
+        agent: 已构造的 Agent。
+        max_iterations: 图迭代上限（单节点通常 1 次）。
 
-    用户要"自我修正循环"可以用 add_conditional_edges 自己写。
+    Returns:
+        入口/出口都是 ``agent`` 节点的 ``Graph``。
+
+    依赖:
+        ``Agent.run``。
     """
     def agent_node(state: dict) -> dict:
         user_input = state.get("input", "")

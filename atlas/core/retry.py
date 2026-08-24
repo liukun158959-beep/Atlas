@@ -19,7 +19,16 @@ def full_jitter_delay_ms(
 ) -> int:
     """计算第 attempt 次重试的延迟毫秒数（Full Jitter）。
 
-    attempt 从 1 开始计数（第 1 次重试=第一次失败后）。
+    Args:
+        attempt: 从 1 开始（第一次失败后的重试）。
+        base_seconds: 指数退避基数。
+        cap_seconds: 延迟上限。
+
+    Returns:
+        延迟毫秒。attempt < 1 则 ValueError。
+
+    依赖:
+        仅标准库 random；由 ``AgentLoop`` 在幂等工具失败时调用。
     """
     if attempt < 1:
         raise ValueError(f"attempt 必须 >=1，实际 {attempt}")
@@ -29,7 +38,11 @@ def full_jitter_delay_ms(
 
 
 def sleep_ms(ms: int) -> None:
-    """按毫秒睡眠（封装 time.sleep，便于将来 mock 或 替换为 asyncio.sleep）。"""
+    """按毫秒睡眠。
+
+    Args:
+        ms: 非负毫秒。
+    """
     if ms < 0:
         raise ValueError(f"ms 必须 >=0，实际 {ms}")
     time.sleep(ms / 1000.0)

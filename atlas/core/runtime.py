@@ -15,7 +15,15 @@ from atlas.journal.base import JournalProtocol
 
 @dataclass
 class Runtime:
-    """内核运行时。journal 必选，其余可选。"""
+    """内核运行时：Journal 必选，其余护栏可插拔。
+
+    Agent 循环、熔断、权限、trace 都从这里取，不在 Agent 上再藏一份。
+
+    依赖:
+        ``JournalProtocol``（必选）；``Terminator`` / ``PluginManager`` /
+        ``CompactManager`` / ``CircuitBreakerRegistry`` / ``PermissionPolicy`` /
+        ``TracerProtocol`` / ``AttachmentRegistry`` 可选。
+    """
 
     journal: JournalProtocol
     terminator: Terminator | None = None
@@ -27,6 +35,7 @@ class Runtime:
     attachment_registry: AttachmentRegistry | None = None
 
     def __post_init__(self) -> None:
+        """补齐可选默认值；``journal is None`` 直接失败。"""
         if self.journal is None:
             raise ValueError("Runtime.journal 必选，禁止 journal=None")
         if self.plugins is None:

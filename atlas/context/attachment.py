@@ -42,7 +42,12 @@ class AttachmentRegistry:
         self._types: dict[str, type[Attachment]] = {}
 
     def register(self, name: str, cls: type[Attachment]) -> None:
-        """注册一个 Attachment 类型，重名时直接报错。"""
+        """注册 Attachment 类型，重名 ValueError。
+
+        Args:
+            name: 类型名。
+            cls: ``Attachment`` 子类。
+        """
         if name in self._types:
             raise ValueError(f"Attachment 类型已存在: {name}")
         if not issubclass(cls, Attachment):
@@ -50,7 +55,12 @@ class AttachmentRegistry:
         self._types[name] = cls
 
     def create(self, name: str, **kwargs: Any) -> Attachment:
-        """按名称创建 Attachment 实例。"""
+        """按已注册类型名构造实例。
+
+        Args:
+            name: ``register`` 时的名字。
+            **kwargs: 传给类型构造函数。
+        """
         if name not in self._types:
             raise ValueError(f"未注册的 Attachment 类型: {name}")
         return self._types[name](**kwargs)
@@ -60,7 +70,14 @@ class AttachmentRegistry:
         return list(self._types.keys())
 
     def rebuild_all(self, agent: Any) -> list[Attachment]:
-        """compact 后从活状态重建 Attachment，不复用旧 isMeta 消息。"""
+        """compact 后从活状态重建 Attachment，不复用旧 isMeta 消息。
+
+        Args:
+            agent: 传给各类型 ``rebuild_from_state``。
+
+        依赖:
+            ``CompactManager.apply`` 之后由 AgentLoop 调用。
+        """
         rebuilt: list[Attachment] = []
         for cls in self._types.values():
             fn = getattr(cls, "rebuild_from_state", None)

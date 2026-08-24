@@ -38,7 +38,11 @@ class LeakageGuard(Protocol):
     """Leakage 防御协议：检查 prompt 是否含越狱/注入模式。"""
 
     def check(self, prompt: str) -> LeakageCheckResult:
-        """检查 prompt，返回 LeakageCheckResult。"""
+        """检查 prompt 是否含越狱/注入模式。
+
+        Args:
+            prompt: 候选 system_prompt。
+        """
         ...
 
 
@@ -208,20 +212,16 @@ def _extract_archived_failures(agent: Any) -> list[str]:
 
 
 def evolve_prompt(agent: Any) -> EvolutionResult:
-    """Prompt 进化闭环：propose → fitness → leakage → apply/archive。
+    """进化一代 system_prompt：提案 → 适应度 → leakage → apply/archive。
 
-    Q7=B + Q11=B：返回 EvolutionResult。
-    流程：
-        1. build_self_snapshot(agent)
-        2. 从 archive 提取 fitness_history + archived_failures
-        3. 调 agent.llm.chat 生成 JSON 提案（target_type=system_prompt）
-        4. 权限校验（check_permission('system_prompt') 必须 BUFFERED）
-        5. FitnessEvaluator.evaluate(proposed_value) → FitnessResult
-        6. 构造 EvaluationResult（passed = score >= FITNESS_THRESHOLD）
-        7. 如果 fitness 通过 → LeakageGuard.check(proposed_value)
-        8. 如果 leakage 通过 → apply_diff + agent.generation += 1
-        9. archive.add(proposal, evaluation)（无论通过与否）
-        10. 返回 EvolutionResult
+    Args:
+        agent: 需 fitness_evaluator；建议有 archive_store。
+
+    Returns:
+        ``EvolutionResult``。
+
+    依赖:
+        ``LLM.chat``、``FitnessEvaluator``、``LeakageGuard``、``apply_diff``、``ArchiveStore``。
     """
     snapshot = build_self_snapshot(agent)
     fitness_history = _extract_fitness_history(agent)
@@ -331,15 +331,14 @@ def evolve_prompt(agent: Any) -> EvolutionResult:
 # =============================================================
 
 def rollback_to(agent: Any, target_generation: int) -> None:
-    """回滚到指定代数。
+    """把 system_prompt 回滚到指定已通过代数。
 
-    Q3=B：回滚所有 target_type 的 apply 结果（当前实际只改 system_prompt，skill 未来会用到）。
-    Q7=A：agent.generation 同步回退到 target_generation。
+    Args:
+        agent: 必须有 archive_store。
+        target_generation: 0=原始 prompt；N>=1=第 N 代通过提案。
 
-    规则：
-    - target_generation=0 → 恢复第 0 代（初始 state），用第 1 代通过提案的 proposal.current_value
-    - target_generation=N (N>=1) → 恢复第 N 代 apply 后的 state，用第 N 代通过提案的 proposal.proposed_value
-    - 如果目标代没有通过的提案 → 抛 ValueError（不静默失败）
+    依赖:
+        ``ArchiveStore.get_passed_at``、``apply_diff`` 同款替换逻辑。
     """
     archive_store = getattr(agent, "archive_store", None)
     if archive_store is None:
@@ -391,13 +390,19 @@ def evolve_prompt_until_converged(
     convergence_threshold: float = DEFAULT_CONVERGENCE_THRESHOLD,
     no_progress_n: int = DEFAULT_NO_PROGRESS_N,
 ) -> EvolutionSummary:
-    """多代循环 evolve_prompt 直到收敛或达上限。
+    """循环 evolve_prompt 直到收敛、代数用尽或连续无进展。
 
-    Q1=A：连续 convergence_n 代 fitness 提升 < threshold → 收敛停止
-    Q2=A：max_generations 默认 10，到达停止
-    Q6=A：连续 no_progress_n 代未 apply 成功 → 无进展停止
+    Args:
+        agent: 同 ``evolve_prompt``。
+        max_generations: 最多代数。
+        convergence_n / convergence_threshold: 已 apply 分数的收敛窗口。
+        no_progress_n: 连续未 apply 则停。
 
-    返回 EvolutionSummary(generations, final_generation, final_score, stop_reason)
+    Returns:
+        ``EvolutionSummary``。
+
+    依赖:
+        ``evolve_prompt``。
     """
     generations: list[EvolutionResult] = []
     # 仅记录 apply 成功代的 fitness 用于收敛检测

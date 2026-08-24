@@ -50,12 +50,28 @@ class Memory:
     # 消息写入：全部写入 _runtime_messages
     # ------------------------------------------------------------------
     def add_user(self, content: str) -> None:
+        """追加一条 user 消息。
+
+        Args:
+            content: 用户文本。
+        """
         self._runtime_messages.append({"role": "user", "content": content})
 
     def add_assistant(self, message: dict) -> None:
+        """追加一条 assistant 消息（可含 tool_calls）。
+
+        Args:
+            message: OpenAI assistant 消息 dict。
+        """
         self._runtime_messages.append(message)
 
     def add_tool(self, content: str, tool_call_id: str) -> None:
+        """追加一条 tool 结果。
+
+        Args:
+            content: 工具输出文本。
+            tool_call_id: 对应 assistant.tool_calls[].id。
+        """
         self._runtime_messages.append(
             {"role": "tool", "content": content, "tool_call_id": tool_call_id}
         )
@@ -90,6 +106,7 @@ class Memory:
         self._token_count = prompt_tokens
 
     def get_token_count(self) -> int:
+        """最近一次 LLM usage 写入的 prompt token 数。"""
         return self._token_count
 
     def reset_token_count(self) -> None:

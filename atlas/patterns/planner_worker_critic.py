@@ -200,11 +200,16 @@ class PlannerWorkerCritic:
     # 外部 API
     # ──────────────────────────────────────────────
     def run(self, task: str | None = None) -> PWCResult:
-        """运行完整 PWC 流程。task 若传则覆盖构造函数 task 字段。
+        """跑完 Planner → Worker → Critic 质量闭环。
 
-        返回 PWCResult(final_answer, trace)。
+        Args:
+            task: 覆盖构造时的任务；两者都空则 ValueError。
 
-        流程：Phase A 拆解 → Phase B 串行子任务（Worker→Critic→重做）→ Phase C 汇总标注
+        Returns:
+            ``PWCResult(final_answer, trace)``。
+
+        依赖:
+            ``Agent`` / ``LLM`` / ``Toolkit``；内部 ``_make_agent``。
         """
         run_task = task or self.task
         if not run_task:

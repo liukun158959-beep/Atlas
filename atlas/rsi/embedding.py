@@ -16,7 +16,11 @@ class EmbeddingProtocol(Protocol):
     """文本向量化协议。"""
 
     def embed(self, text: str) -> list[float]:
-        """文本 -> 向量。"""
+        """文本 → 向量。
+
+        Args:
+            text: 任意字符串。
+        """
         ...
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:

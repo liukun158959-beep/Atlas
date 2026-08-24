@@ -33,31 +33,59 @@ class JournalProtocol(Protocol):
     """Journal 抽象接口，后续 SQLite 实现只需实现此 Protocol。"""
 
     def append(self, event: JournalEvent) -> None:
-        """追加一条事件（append-only，不可修改）。"""
+        """追加一条事件（append-only，不可修改）。
+
+        Args:
+            event: 含 run_id / seq / event_type / payload。
+        """
         ...
 
     def get_events(self, run_id: str) -> list[JournalEvent]:
-        """获取指定 run 的全部事件，按 seq 升序。"""
+        """按 seq 升序取出该 run 的全部事件。
+
+        Args:
+            run_id: 运行 id。
+        """
         ...
 
     def replay(self, run_id: str) -> dict:
-        """重放指定 run 的事件，返回重放后的状态摘要。"""
+        """重放并返回摘要（给旧 demo）；完整恢复用 restore。
+
+        Args:
+            run_id: 运行 id。
+        """
         ...
 
     def list_run_ids(self) -> list[str]:
-        """列出所有 run_id。"""
+        """列出已知 run_id。"""
         ...
 
     def cache_get(self, key: str) -> str | None:
-        """按幂等键取缓存值，无则返回 None。"""
+        """按幂等键取缓存；没有则 None。
+
+        Args:
+            key: 通常是 ``idempotency.derive`` 的结果。
+        """
         ...
 
     def cache_set(self, key: str, value: str) -> None:
-        """按幂等键写缓存值（覆盖写）。"""
+        """按幂等键覆盖写入工具结果。
+
+        Args:
+            key: 幂等键。
+            value: 序列化后的工具输出。
+        """
         ...
 
     def restore(self, run_id: str) -> Any:
-        """从事件重建 RunSnapshot（Memory / saga / 终止上下文）。"""
+        """从事件重建 ``RunSnapshot``（Memory / saga / 终止上下文）。
+
+        Args:
+            run_id: 运行 id。
+
+        依赖:
+            ``atlas.journal.restore.restore_from_events``。
+        """
         ...
 
 
@@ -119,9 +147,11 @@ class InMemoryJournal:
     _cache: dict[str, str] = field(default_factory=dict)
 
     def cache_get(self, key: str) -> str | None:
+        """按幂等键取缓存。"""
         return self._cache.get(key)
 
     def cache_set(self, key: str, value: str) -> None:
+        """按幂等键覆盖写缓存。"""
         self._cache[key] = value
 
     def append(self, event: JournalEvent) -> None:
@@ -149,7 +179,14 @@ class InMemoryJournal:
         )
 
     def restore(self, run_id: str) -> "RunSnapshot":
-        """从事件重建 RunSnapshot。"""
+        """从事件重建 RunSnapshot。
+
+        Args:
+            run_id: 运行 id。
+
+        依赖:
+            ``restore_from_events``。
+        """
         from .restore import restore_from_events
 
         return restore_from_events(self.get_events(run_id))
@@ -182,7 +219,13 @@ class InMemoryJournal:
         return seen
 
     def make_event(self, run_id: str, event_type: str, payload: dict) -> JournalEvent:
-        """便捷工厂：自动生成 seq 和 ts。"""
+        """组装一条事件（自动分配 seq 与时间戳）。
+
+        Args:
+            run_id: 运行 id。
+            event_type: 如 agent_start / llm_after_call。
+            payload: 自由 dict。
+        """
         return JournalEvent(
             run_id=run_id,
             seq=self.next_seq(run_id),

@@ -65,6 +65,9 @@ class SuspendNode:
     """
 
     def __init__(self, prompt_fn: Callable[[dict], str]) -> None:
+        """Args:
+            prompt_fn: 根据当前 graph state 生成给人看的提示。
+        """
         self.prompt_fn = prompt_fn
 
     def __call__(self, state: dict) -> dict:

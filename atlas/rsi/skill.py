@@ -28,7 +28,14 @@ class Skill:
     metadata: dict = field(default_factory=dict)
 
     def to_tool(self) -> Tool:
-        """将 Skill code 包装成 Tool；执行走 subprocess 沙箱，禁止进程内 exec。"""
+        """把 skill code 包成 Tool；执行走 subprocess 沙箱。
+
+        Returns:
+            ``Tool``，func 内部调 ``run_skill_in_sandbox``。
+
+        依赖:
+            ``atlas.rsi.sandbox.run_skill_in_sandbox``、``atlas.tools.base.Tool``。
+        """
         from .sandbox import run_skill_in_sandbox
 
         code = self.code
@@ -58,6 +65,10 @@ class SkillLibrary:
         embedding: EmbeddingProtocol,
         vector_store: VectorStoreProtocol,
     ) -> None:
+        """Args:
+            embedding: 文本向量。
+            vector_store: 可插拔向量库。
+        """
         self._embedding = embedding
         self._vs = vector_store
         # 内存索引：skill_id -> Skill（用于 get/list_all 快速访问）
@@ -66,9 +77,16 @@ class SkillLibrary:
         self._versions: dict[str, int] = {}
 
     def register(self, skill: Skill) -> str:
-        """入库一个 Skill，返回 skill_id。
+        """入库一个 Skill，同名自动升版本。
 
-        同 name 的新版本自动递增 version。
+        Args:
+            skill: 技能；embedding 为空则用 description 现算。
+
+        Returns:
+            skill_id，格式 ``{name}_v{version}``。
+
+        依赖:
+            ``EmbeddingProtocol.embed``、``VectorStoreProtocol.add``。
         """
         # 版本递增
         if skill.name in self._versions:
@@ -98,7 +116,15 @@ class SkillLibrary:
         return skill_id
 
     def retrieve(self, query: str, top_k: int = 5) -> list[Skill]:
-        """语义检索：query 文本 -> embedding -> VectorStore top_k -> 返回 Skill 列表。"""
+        """按描述语义检索技能。
+
+        Args:
+            query: 查询文本。
+            top_k: 返回条数。
+
+        依赖:
+            ``EmbeddingProtocol.embed``、``VectorStoreProtocol.query``。
+        """
         query_emb = self._embedding.embed(query)
         hits = self._vs.query(query_emb, top_k)
         results: list[Skill] = []

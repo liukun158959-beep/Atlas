@@ -72,12 +72,20 @@ class Toolkit:
         retry_on: tuple[type[Exception], ...] = (TimeoutError, ConnectionError),
         retry_max: int = 3,
     ) -> Tool:
-        """注册一个工具，重名时直接报错（消除命名冲突的模糊性）。
+        """注册一个工具，重名直接报错。
 
-        三分类标志约束：
-        - isReadOnly=True 自动强制 isIdempotent=True（纯查询天然幂等）
-        - hasSideEffects=True 且 isIdempotent=False 必须注册 compensate()，否则 ValueError 拒绝
-        - 非幂等工具禁止自动重试（retry_max 必须=0），否则 ValueError 拒绝
+        Args:
+            func: ``dict -> str`` 实现。
+            name / description / parameters: OpenAI function schema。
+            isReadOnly / isIdempotent / hasSideEffects: Tool ABI 三分类。
+            compensate: 非幂等副作用必须提供。
+            circuit_key / retry_on / retry_max: 熔断与重试；非幂等禁止 retry_max>0。
+
+        Returns:
+            已登记的 ``Tool``。
+
+        依赖:
+            ``jsonschema``（validate_input）；由 ``AgentLoop`` 按名 ``execute``。
         """
         if name in self._tools:
             raise ValueError(f"工具已存在: {name}")
@@ -111,6 +119,11 @@ class Toolkit:
         return tool
 
     def get(self, name: str) -> Tool:
+        """按名取工具；未注册则 KeyError。
+
+        Args:
+            name: 注册时的工具名。
+        """
         if name not in self._tools:
             raise KeyError(f"未注册的工具: {name}")
         return self._tools[name]

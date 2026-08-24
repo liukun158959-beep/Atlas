@@ -24,14 +24,16 @@ class SelfSnapshot:
 
 
 def build_self_snapshot(agent: Any) -> SelfSnapshot:
-    """从 Agent 读取各字段构造 SelfSnapshot。
+    """从 Agent 读 prompt / 工具 / 技能 / 失败记忆，供进化用。
 
-    agent 需有以下属性：
-    - memory.messages: list[dict]（含 role=system 的消息）
-    - tools: Toolkit（有 to_openai_tools() 方法）
-    - skill_library: SkillLibrary | None
-    - failure_memory: FailureMemory | None
-    - compact_manager: CompactManager | None
+    Args:
+        agent: 需有 memory、tools；skill_library / failure_memory 可为 None。
+
+    Returns:
+        ``SelfSnapshot``。
+
+    依赖:
+        ``Toolkit.to_openai_tools``、可选 ``SkillLibrary.list_all`` / ``FailureMemory.list_recent``。
     """
     # system_prompt：从 memory.messages 中找 role=system
     system_prompt = ""
