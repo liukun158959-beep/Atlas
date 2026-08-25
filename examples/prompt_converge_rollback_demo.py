@@ -1,13 +1,13 @@
 """Phase 4.2b 增强演示：收敛检测 + 多代回滚。
 
-3 个独立场景共享 8 项断言：
+3 个独立场景共享 9 项断言：
   Part 1（收敛）：FakeFitnessEvaluator 分数先升后 plateau（0.2→0.5→0.7→0.71→0.72）
     → 连续 3 代（0.7→0.71→0.72）提升 < 0.01 threshold → converged
   Part 2（max_generations）：max_generations=2 → 只跑 2 代 → stop_reason="max_generations"
   Part 3（无进展 + 回滚）：FakeLLM 连续 3 代都返回 fit<0.5 → no_progress
     → 再跑 2 代成功（0.6→0.9 generation=2）→ rollback_to(0) 恢复原始 + rollback_to(1) 恢复第 1 代
 
-8 项断言：
+9 项断言：
   ① Part 1 返回 EvolutionSummary
   ② Part 1 stop_reason="converged"（连续 3 代提升 < 0.01）
   ③ Part 2 stop_reason="max_generations"（max_generations=2）
@@ -16,6 +16,7 @@
   ⑥ Part 3 stop_reason="no_progress"（连续 3 代未 apply）
   ⑦ generations 列表长度正确（Part 1: 5 代收敛 / Part 2: 2 代 / Part 3: 3 代 no_progress + 2 代成功）
   ⑧ Part 3 rollback 后 generation 字段回退（0→1→0）
+  ⑨ Part 1 结束后写出进化报告 Markdown（初始 Prompt / 每代 diff / 最终 Prompt）
 
 运行方式：
   python examples/prompt_converge_rollback_demo.py --plain
@@ -24,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from atlas import Agent
@@ -35,6 +38,7 @@ from atlas.rsi import (
     ArchiveStore,
     FakeFitnessEvaluator,
     RegexLeakageGuard,
+    export_evolution_report,
 )
 from atlas.tools.base import Toolkit
 
@@ -140,7 +144,7 @@ def _current_sys(agent: Agent) -> str:
 # Part 1：收敛
 # =============================================================
 
-def run_part1() -> dict:
+def run_part1(report_path: Path) -> dict:
     agent = _make_agent(Part1ConvergenceFitness())
     # convergence_n=3, threshold=0.01 → 代 3-5 plateau 0.7→0.71→0.72（提升 <0.01）
     summary = agent.evolve_prompt_until_converged(
@@ -149,6 +153,8 @@ def run_part1() -> dict:
         convergence_threshold=0.01,
         no_progress_n=3,
     )
+    written = export_evolution_report(report_path, summary, ORIGINAL_PROMPT)
+    report_text = written.read_text(encoding="utf-8")
     return {
         "type": type(summary).__name__,
         "stop_reason": summary.stop_reason,
@@ -156,6 +162,8 @@ def run_part1() -> dict:
         "final_score": summary.final_score,
         "num_generations": len(summary.generations),
         "scores": [g.evaluation.score for g in summary.generations],
+        "report_path": str(written),
+        "report_text": report_text,
     }
 
 
@@ -274,6 +282,20 @@ def assert_8(p1: dict, p2: dict, p3: dict) -> list[tuple[str, bool, str]]:
     assertions.append(("⑧ rollback generation 回退正确", ok8,
                        f"gen2={p3['gen2_generation']} → rb0={p3['after_rollback_0_gen']} → rb1={p3['after_rollback_1_gen']}"))
 
+    # ⑨ Part 1 进化报告已写出，含初始 / 最终 / 停止原因
+    report_text = p1.get("report_text") or ""
+    report_path = p1.get("report_path") or ""
+    ok9 = (
+        bool(report_path)
+        and Path(report_path).is_file()
+        and "初始 Prompt" in report_text
+        and "最终 Prompt" in report_text
+        and "停止原因" in report_text
+        and p1["stop_reason"] in report_text
+    )
+    assertions.append(("⑨ Part 1 写出进化报告 Markdown", ok9,
+                       f"path={report_path}, has_sections={ok9}"))
+
     return assertions
 
 
@@ -290,42 +312,45 @@ def main() -> None:
     print("4.2b 增强演示：收敛检测 + 多代回滚")
     print("=" * 60)
 
-    p1 = run_part1()
-    print("\n[Part 1：收敛]")
-    print(f"  stop_reason={p1['stop_reason']}, gen={p1['final_generation']}, "
-          f"score={p1['final_score']}, 代数={p1['num_generations']}")
-    print(f"  scores={p1['scores']}")
+    with tempfile.TemporaryDirectory(prefix="atlas-evo-report-") as tmp:
+        report_path = Path(tmp) / "part1_evolution.md"
+        p1 = run_part1(report_path)
+        print("\n[Part 1：收敛]")
+        print(f"  stop_reason={p1['stop_reason']}, gen={p1['final_generation']}, "
+              f"score={p1['final_score']}, 代数={p1['num_generations']}")
+        print(f"  scores={p1['scores']}")
+        print(f"  report={p1['report_path']}")
 
-    p2 = run_part2()
-    print("\n[Part 2：max_generations=2]")
-    print(f"  stop_reason={p2['stop_reason']}, 代数={p2['num_generations']}")
+        p2 = run_part2()
+        print("\n[Part 2：max_generations=2]")
+        print(f"  stop_reason={p2['stop_reason']}, 代数={p2['num_generations']}")
 
-    p3 = run_part3()
-    print("\n[Part 3：no_progress + 回滚]")
-    print(f"  no_progress_stop={p3['no_progress_stop_reason']}, "
-          f"代数={p3['no_progress_num_generations']}")
-    print(f"  2 代成功后 generation={p3['gen2_generation']}")
-    print(f"  rollback_to(0) → sys_eq_original={p3['after_rollback_0_sys'] == p3['original_prompt']}, gen={p3['after_rollback_0_gen']}")
-    print(f"  rollback_to(1) → sys_eq_gen1={p3['after_rollback_1_sys'] == p3['gen1_proposed_value']}, gen={p3['after_rollback_1_gen']}")
+        p3 = run_part3()
+        print("\n[Part 3：no_progress + 回滚]")
+        print(f"  no_progress_stop={p3['no_progress_stop_reason']}, "
+              f"代数={p3['no_progress_num_generations']}")
+        print(f"  2 代成功后 generation={p3['gen2_generation']}")
+        print(f"  rollback_to(0) → sys_eq_original={p3['after_rollback_0_sys'] == p3['original_prompt']}, gen={p3['after_rollback_0_gen']}")
+        print(f"  rollback_to(1) → sys_eq_gen1={p3['after_rollback_1_sys'] == p3['gen1_proposed_value']}, gen={p3['after_rollback_1_gen']}")
 
-    print("\n[8 项断言]")
-    assertions = assert_8(p1, p2, p3)
-    all_pass = True
-    for name, ok, detail in assertions:
-        status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] {name}  ({detail})")
-        if not ok:
-            all_pass = False
+        print("\n[9 项断言]")
+        assertions = assert_8(p1, p2, p3)
+        all_pass = True
+        for name, ok, detail in assertions:
+            status = "PASS" if ok else "FAIL"
+            print(f"  [{status}] {name}  ({detail})")
+            if not ok:
+                all_pass = False
 
-    print("\n" + "=" * 60)
-    if all_pass:
-        print("所有 8 项断言通过")
-    else:
-        print("存在失败断言")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        if all_pass:
+            print("所有 9 项断言通过")
+        else:
+            print("存在失败断言")
+        print("=" * 60)
 
-    if not all_pass:
-        raise SystemExit(1)
+        if not all_pass:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

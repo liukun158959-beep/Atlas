@@ -12,7 +12,7 @@ Q18=A：prompt apply 安全 = 验证 role==system + 替换 content，不清空�
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .archive import PermissionLevel, check_permission
@@ -44,6 +44,9 @@ class EvaluationResult:
     score: float                  # 0.0-1.0
     feedback: str                 # 评估反馈
     test_result: str | None = None  # 测试执行结果：None=未执行（非 skill）/ "pass" / "fail: ..."
+    task_results: list = field(default_factory=list)  # 训练题分数/输出；Fake 评估器为空
+    val_score: float | None = None
+    val_task_results: list = field(default_factory=list)
 
 
 # =============================================================

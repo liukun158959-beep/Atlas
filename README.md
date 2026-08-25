@@ -369,7 +369,7 @@ log.warning("saga.compensate.complete",
 - **Transcript 磁盘层（Phase 1 第一批）**：`atlas.context.Transcript` append-only 事件存档；Agent 默认创建，`agent.transcript` 直接访问；Memory 写入点（user/assistant/tool/compact）全部双写 transcript.append；`replay()` 全量返回；`to_jsonl(path)/from_jsonl(path)` JSONL 导出恢复；顶层 `from atlas import Transcript`
 - **compact_demo.py（Phase 1 第一批 demo）**：`--mock` 模式下 CompactFakeLLM 逐轮递增 token（3000→5000→7000→8500→3000），第 4 轮必触发 compact；5 项断言（summary/boundary 存在/project 13→4 条/无 isMeta/Transcript 5+5+1 事件）；真实 LLM 模式 soft 检查（不强制断言，提示加 --mock）
 - **Scope（Phase 1 第二批）**：`atlas.core.Scope` 进程内 per-key 隔离；`_locks[key]` + `_states[key]` 懒创建（双 guard 锁防并发重复造）；`with scope.acquire(key)` context manager 阻塞拿锁 → 返 SimpleNamespace（.key + .state dict）→ `__exit__` 写回 state 并释放锁（异常也释放 + 写回当前状态，不兜底回滚）；key 非空 str 否则 ValueError；`get_state(key)` 返回只读拷贝
-- **极简 Dashboard 骨架（Phase 1 第二批）**：`python -m atlas dashboard --port 8765` 一键启动；HTTP(8765) ThreadingHTTPServer 子线程 + WebSocket(8766) asyncio 当前线程；HTML 三面板字符串内嵌（免读文件路径问题）；左 Run 列表（run_id/status/event_count/step_count/start→end）+ 中 Trace DAG（StepRecord 卡片 + 子 Trace 缩进 + tool_names 绿标）+ 右 Events（最近 200 条，类型着色）；WebSocket 每 500ms 广播 DATASTATE snapshot；`atlas.cli.dashboard.publish(run_id, journal, trace)` 全局 API 主动推送（threading.Lock 保护，journal 全 run 聚合 + trace 递归打平 nodes/edges）
+- **极简 Dashboard 骨架（Phase 1 第二批 + 5.1 进化页）**：`python -m atlas dashboard --port 8765` 一键启动；HTTP(8765) ThreadingHTTPServer 子线程 + WebSocket(8766) asyncio 当前线程；HTML 切页字符串内嵌（运行 / 进化）；运行页：左 Run 列表 + 中 Trace DAG + 右 Events + RESILIENCE 横幅；进化页：SVG fitness 曲线 + 每代 unified diff + 当前 prompt / 回滚按钮；`publish(run_id, journal, trace)` 不覆盖 evolution；`publish_evolution(agent, summary)` + `register_evolution(agent)` + `POST /rsi/rollback`
 - **scope_demo.py（Phase 1 第二批 demo）**：3 项断言（同 key 串行 start>=end / 不同 key 并行总耗时<0.18s / state 写回 first_write=42 跨 acquire 可读）
 - **dashboard_demo.py（Phase 1 第二批 demo）**：后台线程起 dashboard → 3 轮 QuickstartMockLLM calculator mock 跑不同 run_id → 每轮前后 publish() 推送 → 提示用户浏览器打开 http://localhost:8765 → 驻留 10 秒自动退出
 - **三态熔断器（Phase 2.2）**：`atlas.core.CircuitBreakerRegistry` 按 `circuit_key` 管理独立三态状态机（Closed→Open→Half-Open→Closed）；连续失败 N=5 → Open 拒绝请求；冷却窗口 W=30s 后 → Half-Open 放 1 个探测请求（成功→Closed 清零 / 失败→Open 重计时）；`threading.Lock` 线程安全；`allow_request/on_success/on_failure/snapshot` 对外 API；状态变更自动 emit 插件事件（circuit_open/half_open/closed）；Agent 默认自动创建空 Registry（`auto_default_registry=False` 可禁用）
@@ -410,7 +410,10 @@ log.warning("saga.compensate.complete",
 - **Agent Prompt 进化方法（Phase 4.2b）**：`Agent.evolve_prompt() -> EvolutionResult` 委托 `atlas.rsi.evolve_prompt()`（和 self_evolve 并列，内部复用 4.2a apply_diff system_prompt 分支）；`EvolutionResult(generation, proposal, evaluation, leakage_check, applied)` 携带完整进化轨迹；Agent 构造函数新增 `fitness_evaluator` + `leakage_guard` 可选参数 + `generation: int = 0` 计数器（apply 成功后 +1，零侵入）
 - **prompt_evolution_demo.py（Phase 4.2b demo）**：8 项断言全可复现——① 返回 EvolutionResult ② fitness score ∈ [0,1] ③ 反思式变异（第 2 代 prompt 含第 1 代 fitness 历史）④ LeakageGuard 拦截越狱 ⑤ apply 后 system_prompt 替换（generation 0→1）⑥ archive 记录通过+失败 ⑦ 多代进化（gen2 fitness 0.8 > gen1 0.4）⑧ RegexLeakageGuard 正则黑名单命中（matched_patterns 非空）
 - **收敛检测 + 多代回滚（Phase 4.2b 增强）**：`EvolutionSummary(generations, final_generation, final_score, stop_reason)` 多代汇总；`Agent.evolve_prompt_until_converged(max_generations=10, convergence_n=3, convergence_threshold=0.01, no_progress_n=3)` 委托 `atlas.rsi.evolve_prompt_until_converged()`，三种停止条件（converged=连续 N 代 apply 成功 fitness 提升 < threshold / max_generations=达上限 / no_progress=连续 N 代未 apply 成功）；`Agent.rollback_to(target_generation)` 委托 `atlas.rsi.rollback_to()`，target=0 恢复第 1 代提案的 current_value（原始 prompt），target=N 恢复第 N 代提案的 proposed_value，同步回退 `agent.generation`，无对应通过提案直接 ValueError（不兜底）；`ArchiveStore` 扩 `ArchivedProposal.generation`（apply 成功时 = agent.generation，失败 = -1）+ `list_by_generation(generation)` + `get_passed_at(generation)`（每代至多 1 条通过）
-- **prompt_converge_rollback_demo.py（Phase 4.2b 增强 demo）**：8 项断言全可复现——① 返回 EvolutionSummary ② Part 1 converged（Part1ConvergenceFitness 0.2→0.5→0.7→0.71→0.72→0.72→0.721，最近 3 代 [0.72,0.72,0.721] deltas=[0,0.001] max=0.001<0.01，共 7 代收敛）③ Part 2 max_generations（max_generations=2 只跑 2 代停止）④ Part 3 no_progress（Part3NoProgressThenSuccess 0.3→0.2→0.4 连续 3 低分未 apply，stop_reason=no_progress，共 3 代）⑤ rollback_to(0) 恢复原始 prompt + generation=0 ⑥ rollback_to(1) 恢复第 1 代 proposed_value + generation=1 ⑦ generations 列表长度（P1=7 / P2=2 / P3=3）⑧ rollback generation 回退（gen2=2 → rb0=0 → rb1=1）
+- **prompt_converge_rollback_demo.py（Phase 4.2b 增强 demo）**：9 项断言全可复现——① 返回 EvolutionSummary ② Part 1 converged（Part1ConvergenceFitness 0.2→0.5→0.7→0.71→0.72→0.72→0.721，最近 3 代 [0.72,0.72,0.721] deltas=[0,0.001] max=0.001<0.01，共 7 代收敛）③ Part 2 max_generations（max_generations=2 只跑 2 代停止）④ Part 3 no_progress（Part3NoProgressThenSuccess 0.3→0.2→0.4 连续 3 低分未 apply，stop_reason=no_progress，共 3 代）⑤ rollback_to(0) 恢复原始 prompt + generation=0 ⑥ rollback_to(1) 恢复第 1 代 proposed_value + generation=1 ⑦ generations 列表长度（P1=7 / P2=2 / P3=3）⑧ rollback generation 回退（gen2=2 → rb0=0 → rb1=1）⑨ Part 1 结束后写出进化报告 Markdown（初始 Prompt / 每代 diff / 最终 Prompt）
+- **进化报告导出（Phase 5.1）**：`atlas.rsi.export_evolution_report(path, summary, initial_prompt)` 把本次 `EvolutionSummary` 写成 UTF-8 Markdown（元信息 + 初始 prompt + 每次提案 unified diff + 最终 prompt + 前后对比）。path / summary / initial_prompt 均必填，generations 为空或目录不存在直接失败并给恢复指引。不在 evolve 循环里自动落盘，不做 CLI
+- **Dashboard 进化面板（Phase 5.1）**：顶部切页「运行 / 进化」。进化页：原生 SVG fitness 曲线 + 每代 unified diff + 当前 prompt / 回滚按钮。`publish_evolution(agent, summary)` 推快照（不覆盖运行页数据）；`register_evolution(agent)` 同进程挂活 Agent；`POST /rsi/rollback` JSON `{"generation": N}`。未注册 → 409 + 恢复指引
+- **prompt_evolution_dashboard_demo.py（Phase 5.1 demo）**：同进程 Dashboard + Fake 3 代进化；6 项断言。`--real`：MathTrap 陷阱题；初始 prompt 含安全句，提案删句则不 apply
 - **评估器重构 · LLM-as-Judge 多维 Rubric（Phase 4.2b 评估器升级）**：将 benchmark 评估器从硬编码关键字匹配重构为 LLM-as-Judge 多维 Rubric 评估；参考 **GEPA** 结构化失败类型（formatting/reasoning/both）+ **ICAIL** 宽松判官原则（语义匹配不强制特定表达式）+ **DoorDash** 多维加权评分（Correctness 0.5 + Format 0.3 + Reasoning 0.2）+ **UnlimitedJudge** 通用模型稳定性验证（3 轮重复评估标准差=0，failure_type 100% 一致）；5 场景覆盖（数学推理/逻辑推理/格式遵从/安全边界/多约束写作），每场景独立 Judge prompt；安全场景 Judge 显式区分"提到危险名词（教育性拒绝）≠ 给出可操作步骤（配合请求）"；进化效果从硬编码时代 -6.7% 提升到 +3.3%；透明 Walkthrough 脚本 `_evaluator_transparent_walkthrough.py` 展示每一步输入输出（Judge prompt 完整输入、JSON 原始输出、分数映射过程、A/B 对比、多代进化轨迹），消除黑盒
 - **业界标准 Benchmark（Phase 4.2b 验证）**：`prompt_evolution_benchmark.py`（3 场景 × 5 题，LLM-Judge 评估器）+ `prompt_evolution_complex_benchmark.py`（复杂场景，LLM-Judge 评估器）+ `_evaluator_ab_test.py`（硬编码 vs LLM-Judge A/B 对比）+ `_evaluator_transparent_walkthrough.py`（3 模块透明 Walkthrough：数学 A/B + 安全判官误区 + 完整多代进化闭环）
 
@@ -508,6 +511,9 @@ print(agent.trace)
 ```bash
 python -m atlas run --config examples/quickstart.yaml
 python -m atlas run --config examples/quickstart.yaml --resume <run_id>
+python -m atlas ab_test --preset mathtrap --prompt-a a.txt --prompt-b b.txt --n 3 --mock
+python -m atlas ab_test --preset humaneval --prompt-a a.txt --prompt-b b.txt --n 1 --mock
+python -m atlas ab_test --preset multiturn --prompt-a a.txt --prompt-b b.txt --n 1 --mock
 ```
 
 直接运行示例脚本：
@@ -622,11 +628,29 @@ python examples/prompt_evolution_demo.py --plain
 # FakeLLM 根据 prompt 质量返回不同答案 → 低质量 prompt score=0.0 / 高质量 prompt score=1.0
 python examples/taskset_fitness_demo.py --plain
 
-# Phase 4.2b 增强：收敛检测 + 多代回滚（8 项断言全可复现）
+# Phase 4.2b 增强：收敛检测 + 多代回滚 + 进化报告导出（9 项断言全可复现）
 # 3 场景：Part 1 收敛（plateau 0.7→0.71→0.721，convergence_n=3 threshold=0.01）
 #        Part 2 max_generations（只跑 2 代停止）
 #        Part 3 no_progress（连续 3 代低分未 apply）+ rollback_to(0/1) 恢复
+#        Part 1 结束后写出进化报告 Markdown
 python examples/prompt_converge_rollback_demo.py --plain
+
+# Phase 5.1：Dashboard 进化页（fitness 曲线 / 每代 diff / HTTP 回滚，6 项断言）
+python examples/prompt_evolution_dashboard_demo.py --plain
+python examples/prompt_evolution_dashboard_demo.py --plain --real --hold -1
+
+# Phase 5.2：两个 prompt 在 MathTrap 上 A/B（6 项断言，--mock）
+python examples/ab_test_demo.py --plain
+
+# Phase 5.2：HumanEval 子集编码 Benchmark（沙箱隐式用例，--mock 断言 / --real 真模型）
+python examples/code_evolution_demo.py --plain
+python examples/code_evolution_demo.py --real
+python examples/code_evolution_demo.py --evolve
+python examples/code_evolution_demo.py --evolve --real
+
+# Phase 5.2：多轮对话（换话题召回 + mock compact，--mock 断言 / --real 真模型）
+python examples/multiturn_evolution_demo.py --plain
+python examples/multiturn_evolution_demo.py --real
 ```
 
 独立 Evaluator 用法示例（内核外调用，Agent 不自评）：
@@ -695,7 +719,8 @@ Atlas/
 │   ├── cli/                # CLI 子命令
 │   │   ├── init.py         # atlas init：venv + 依赖安装 + .env 配置
 │   │   ├── run.py          # atlas run --config YAML [--resume run_id]
-│   │   └── dashboard.py    # HTTP(8765)+WebSocket(8766) Dashboard
+│   │   ├── dashboard.py    # HTTP(8765)+WebSocket(8766) Dashboard
+│   │   └── ab_test.py      # atlas ab_test --preset mathtrap|humaneval|multiturn
 │   ├── patterns/           # Phase 2.3 新增：产品级多 Agent 模式包（独立于 atlas.core，仅组合内核原语）
 │   │   ├── __init__.py     # re-export PlannerWorkerCritic / PWCResult / PWCTrace / OrchestratorWorkers / OWResult / OWTrace（不进 atlas 顶层导出）
 │   │   ├── _common.py      # 内部共享辅助：_make_agent（从 Agent.__init__ 参数表 copy 适配）+ _validate_artifact_schema
@@ -706,16 +731,22 @@ Atlas/
 │   │   ├── embedding.py    # EmbeddingProtocol（embed/embed_batch/dimension）+ FakeEmbedding（MD5 hash 64 维确定性）+ OpenAIEmbedding（复用 LLM client）
 │   │   ├── vector_store.py # VectorStoreProtocol（add/query/get/delete/count）+ VectorHit + SQLiteVectorStore（bytes 存 SQLite + 纯 Python 余弦相似度）
 │   │   ├── skill.py        # Skill + SkillLibrary；to_tool() 走 subprocess 沙箱，禁止进程内 exec
-│   │   ├── sandbox.py      # 受限解释器：超时 + builtins 白名单
+│   │   ├── sandbox.py      # 受限解释器：超时 + builtins 白名单；函数用例核对
 │   │   ├── _sandbox_worker.py
 │   │   ├── failure.py      # FailureCase dataclass + FailureMemory（record/retrieve/list_recent）+ FailureMemoryCollector(BasePlugin)（挂 3 钩子 + weakref 读 Agent 上下文）
 │   │   ├── inspector.py    # SelfSnapshot dataclass（5 字段）+ build_self_snapshot(agent)
 │   │   ├── archive.py      # Phase 4.2a 新增：PermissionLevel 枚举（CORE/BUFFERED/FREE）+ check_permission() + ArchivedProposal（4.2b扩 generation 字段）+ ArchiveStore（add/list_recent/list_failed/list_passed/count + 4.2b扩 list_by_generation/get_passed_at）
 │   │   ├── evolver.py      # Phase 4.2a 新增：ProposedDiff + EvaluationResult dataclass + propose_diff/evaluate/apply_diff/self_evolve + _parse_json（容错）+ _test_skill_code（exec + 同名函数存在）
-│   │   ├── fitness.py      # Phase 4.2b 新增：FitnessResult dataclass + FitnessEvaluator Protocol + FakeFitnessEvaluator（0.4/0.8/0.3 确定性序列）+ TaskSetFitnessEvaluator（真实接口预留骨架）
+│   │   ├── fitness.py      # Phase 4.2b：FitnessResult + FitnessEvaluator + FakeFitnessEvaluator + TaskSetFitnessEvaluator + TrainValFitnessEvaluator(inner_cls)
+│   │   ├── code_fitness.py # Phase 5.2：抽出 Python + CodeFitnessEvaluator（沙箱隐式用例；失败再修 1 次）
+│   │   ├── multiturn_fitness.py # Phase 5.2：MultiTurnFitnessEvaluator（段内连续 run，只打最后一轮）
+│   │   ├── humaneval_tasks.py # Phase 5.2：HumanEval 3 train + 3 val + mock LLM
+│   │   ├── mathtrap_tasks.py # Phase 5.2：MathTrap 3 train + 3 val
+│   │   ├── multiturn_tasks.py # Phase 5.2：多轮 3 train + 3 val + mock LLM
+│   │   ├── ab_test.py      # Phase 5.2：ab_test_prompts + MathTrap mock
 │   │   └── prompt_evolver.py # Phase 4.2b 新增：LeakageCheckResult + LeakageGuard Protocol + RegexLeakageGuard（默认 ~10 中英文越狱模式 + extra_patterns）+ EvolutionResult + evolve_prompt（反思式变异闭环）+ 4.2b增强 EvolutionSummary（多代汇总三停止条件）+ evolve_prompt_until_converged（收敛/上限/无进展）+ rollback_to（按代回滚 system_prompt + generation）+ _build_evolution_prompt/_extract_fitness_history/_extract_archived_failures
 │   ├── providers.py        # LLM provider 预设表
-│   └── __main__.py         # CLI：python -m atlas {init,dashboard,run}
+│   └── __main__.py         # CLI：python -m atlas {init,dashboard,run,ab_test}
 ├── tests/                  # pytest 内核回归（DR-0 / durable / permission / sandbox / compact / yaml）
 ├── .github/workflows/ci.yml
 ├── examples/
@@ -742,7 +773,11 @@ Atlas/
 │   ├── rsi_evolution_demo.py# Phase 4.2a 新增：RSI 自进化闭环 demo（7 项断言：propose_diff + 权限校验 + 测试通过 + 测试拒绝不调 LLM + Critic 通过 + apply 版本递增 + archive 失败反馈）
 │   ├── prompt_evolution_demo.py # Phase 4.2b 新增：Prompt 进化 demo（8 项断言：EvolutionResult + fitness score + 反思式变异 + Leakage 拦截 + apply 替换 + archive 通过+失败 + 多代 fitness 上升 + 正则黑名单命中）
 │   ├── taskset_fitness_demo.py # TaskSetFitnessEvaluator demo（6 项断言：FitnessResult + score ∈ [0,1] + task_results 长度 + 低质 prompt 0.0 + 高质 prompt 1.0 + feedback 详情）
-│   └── prompt_converge_rollback_demo.py # Phase 4.2b 增强：收敛检测 + 多代回滚 demo（8 项断言：EvolutionSummary + converged/MaxGenerations/NoProgress 三停止 + rollback 恢复原始/第1代 + generation 回退）
+│   ├── prompt_converge_rollback_demo.py # Phase 4.2b 增强 + 5.1：收敛/回滚 + 进化报告（9 项断言）
+│   ├── prompt_evolution_dashboard_demo.py # Phase 5.1/5.2：Dashboard 进化页（train/val 双曲线 / 每题输出 / HTTP 回滚）
+│   ├── ab_test_demo.py     # Phase 5.2：atlas ab_test mock（弱 prompt 0 分 / 强 prompt 1 分 / CLI 一致）
+│   ├── code_evolution_demo.py # Phase 5.2：HumanEval A/B + --evolve Prompt 进化
+│   └── multiturn_evolution_demo.py # Phase 5.2：多轮对话 Benchmark（换话题召回 + mock compact）
 ├── docs_feishu/            # 飞书文档源文件与实现计划
 ├── .env.example            # 配置文件模板
 ├── pyproject.toml          # 项目元数据与依赖
@@ -888,7 +923,7 @@ Phase 2.3 遗留项，Phase 3.1 Edge + Phase 3.2 Suspend/Resume 落地后实施�
 - [x] **多代回滚（durable 代数恢复）**—— `rollback_to(target_generation)`：target=0 恢复第 1 代通过提案的 proposal.current_value（原始 prompt，snapshot 强制覆盖 LLM 返回值，不可信）；target=N≥1 恢复第 N 代通过提案的 proposal.proposed_value；同步 `agent.generation = target_generation`（回退一致）；无对应通过提案直接 ValueError（不兜底，消除 fallback）；复用 apply_diff 复用 system_prompt 替换逻辑
 - [x] **ArchiveStore 按代查询**—— `ArchivedProposal.generation` 字段（apply 成功传 `agent.generation` 新代，失败 -1）；`list_by_generation(generation)` 返回指定代所有归档；`get_passed_at(generation)` 返回指定代通过提案（每代至多 1 条）；回滚完全依赖 archive，无其他持久化状态
 - [x] **Agent 方法追加**—— `Agent.evolve_prompt_until_converged(max_generations, convergence_n, convergence_threshold, no_progress_n)` 委托 rsi；`Agent.rollback_to(target_generation)` 委托 rsi；和 evolve_prompt/self_evolve 风格一致（Agent 薄封装 + rsi 主实现）
-- [x] **prompt_converge_rollback_demo.py**—— 8 项断言全可复现：① EvolutionSummary 类型 ② Part 1 converged（Part1ConvergenceFitness 0.2→0.5→0.7→0.71→0.72→0.72→0.721 共 7 代，最近 3 代 [0.72,0.72,0.721] deltas=[0,0.001] max=0.001<0.01）③ Part 2 max_generations=2（只跑 2 代，stop=max_generations）④ Part 3 no_progress（连续 3 代 fitness<0.5 未 apply，stop=no_progress）⑤ rollback_to(0) 恢复原始 prompt + generation=0 ⑥ rollback_to(1) 恢复第 1 代 proposed_value + generation=1 ⑦ generations 列表长度（P1=7 / P2=2 / P3=3）⑧ rollback generation 回退（gen2=2 → rb0=0 → rb1=1）
+- [x] **prompt_converge_rollback_demo.py**—— 9 项断言全可复现：前 8 项同收敛/回滚；⑨ Part 1 写出进化报告 Markdown
 - [x] **V1 单步 + V2 两个 demo 16 项 + V3 全回归**（21 demo 通过：tool_abi/terminator/plugin_cost/saga/compact/scope/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/taskset_fitness/prompt_evolution/prompt_converge_rollback + 其他回归；journal_replay/circuit_retry 因旧 RichRenderer.available() 遗留报错非本次修改，其余全绿）
 - [x] **V1 单步 + V2 demo 8 项 + V3 全回归**（19 demo 通过：quickstart/saga/parallel_subagent/journal_replay/terminator/plugin_cost/compact/scope/dashboard/circuit_retry/pwc/orchestrator_workers/edge/parallel_edge/suspend_resume/rsi_demo/rsi_evolution/tool_abi/prompt_evolution）
 - [x] **FREE 层说明**—— 4.2b 实际在 BUFFERED 层（system_prompt 受控修改 + evaluate + leakage 门控），FREE 自由层沙箱留给未来工具自生成场景
@@ -913,17 +948,18 @@ Phase 4 完成了 RSI 自进化基础设施（感知层 + 修改层 + Prompt 进
 
 #### 5.1 端到端产品体验
 
-- [x] **Atlas CLI 最小入口**—— `python -m atlas run --config path.yaml` 组装 Runtime+Agent 并打印答案；`--resume <run_id>` 走 Journal 续跑。不做 `atlas evolve` / RSI 面板 / Marketplace
-- [ ] **Web UI 进化面板**—— Dashboard 扩展 RSI 面板：进化轨迹图（fitness 曲线 + 每代 diff 摘要）、回滚操作按钮、fitness 评估明细展开
+- [x] **Atlas CLI 最小入口**—— `python -m atlas run --config path.yaml` 组装 Runtime+Agent 并打印答案；`--resume <run_id>` 走 Journal 续跑。不做 `atlas evolve` / Marketplace
+- [x] **Web UI 进化面板**—— Dashboard 切页「运行 / 进化」：SVG fitness 曲线 + 每代 unified diff + 回滚按钮；`publish_evolution` / `register_evolution` / `POST /rsi/rollback`（同进程活 Agent）；未注册 409
 - [x] **配置化 Agent 声明（最小）**—— YAML：`agent.system_prompt/tools/max_steps/compact_threshold` + `llm.provider/model` + `task`；缺字段 `RuntimeError`，不给静默默认。进化相关字段不在本入口
-- [ ] **进化报告导出**—— 进化完成后自动生成 Markdown 报告（初始 prompt → 每代改动 + fitness → 最终 prompt + 前后对比）
+- [x] **进化报告导出**—— `export_evolution_report(path, summary, initial_prompt)` 生成 Markdown（初始 prompt → 每代改动 + fitness → 最终 prompt + 前后对比）；调用方显式传路径，不自动写文件
 
 #### 5.2 真实场景验证
 
-- [ ] **编码场景 Benchmark**—— 在真实代码生成任务上验证 Prompt 进化效果（如 HumanEval / MBPP 子集，评估代码正确率 + 格式规范 + 推理质量）
-- [ ] **多轮对话场景**—— 验证 Prompt 进化在多轮对话中的效果（不只是单轮 task，还包括上下文理解 + 话题切换 + 长对话 compact 后的 prompt 鲁棒性）
-- [ ] **A/B 测试框架**—— `atlas ab_test` 命令：同一任务集，初始 prompt vs 进化后 prompt，跑 N 轮取均值 + 标准差 + 显著性检验
-- [ ] **Safety 退化检测**—— 在 propose prompt 中注入 safety 元规则（进化不可降低安全约束），防止 Prompt 进化优化 format 维度时损害 safety 维度
+- [x] **Train/Val 拆分（`--real`）**—— MathTrap 公开陷阱题（无定义/缺条件/矛盾）。train 决定 apply；val 不得下降；train 已满分时 val 严格升高也可 apply。看板双曲线 + 每题输出
+- [x] **编码场景 Benchmark**—— HumanEval 手抄 3 train + 3 val；抽出代码后 subprocess 沙箱跑隐式用例（过=1 否则=0）。题内失败后再修 1 次（Agent 可见沙箱错误，evolve feedback 仍不写期望）。`code_evolution_demo.py`（`--plain`/`--real` A/B；`--evolve` mock 进化 0→1 apply；`--evolve --real` 真进化）。不上 Judge。MathTrap 看板不动
+- [x] **多轮对话场景**—— 3 train + 3 val，每段 3 轮（立事实 → 换话题 → 追问），只打最后一轮关键字。`multiturn_evolution_demo.py`；`ab_test --preset multiturn`。mock 第 2 轮触发 compact；val 姓名段真跑也会压历史。不上 Judge
+- [x] **A/B 测试框架**—— `python -m atlas ab_test --preset mathtrap|humaneval|multiturn --prompt-a/--prompt-b --n`：同一 6 题，n 轮均值 + 样本标准差。`--mock` 不调真模型。不做 p 值
+- [x] **Safety 退化检测**—— `--real` 初始 prompt 含固定安全句；`safety_contract` 硬门：提案未原样包含则不 apply、不打任务集。Fake 不设 contract
 
 #### 5.3 开发者生态
 

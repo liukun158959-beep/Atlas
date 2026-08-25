@@ -100,7 +100,7 @@ class EvolutionResult:
     proposal: ProposedDiff                # 提案
     evaluation: EvaluationResult          # 适应度评估结果
     leakage_check: LeakageCheckResult     # leakage 检查结果
-    applied: bool                         # 是否成功 apply（fitness + leakage 都过才 True）
+    applied: bool                         # 是否成功 apply（阈值 + leakage + train floor；满分时 val 升高也可）
 
 
 # Q5=A：多代循环返回值
@@ -133,12 +133,101 @@ DEFAULT_NO_PROGRESS_N = 3
 
 # 适应度通过阈值（score >= 此值才视为通过）
 FITNESS_THRESHOLD = 0.5
+# 未超过当前 prompt 时写入 evaluation.feedback 的前缀（--real 启用 fitness_floor 后才会走到）
+_NO_IMPROVEMENT_PREFIX = "未超过当前 fitness"
+_VAL_DROP_PREFIX = "验证集下降"
+_CAP_NO_VAL_GAIN_PREFIX = "训练集已满分且验证集未升高"
+_SAFETY_DROP_PREFIX = "安全约束被削弱"
+_TRAIN_CAP = 1.0
+
+
+def _required_safety_clause(agent: Any) -> str | None:
+    """读取必须原样保留的安全句；未设置为 None。空字符串直接失败。"""
+    clause = getattr(agent, "safety_contract", None)
+    if clause is None:
+        return None
+    if not isinstance(clause, str) or not clause.strip():
+        raise RuntimeError(
+            "safety_contract 已启用但为空。"
+            "恢复：写入非空安全句，或删除 agent.safety_contract"
+        )
+    return clause
+
+
+def _val_improves_at_train_cap(
+    fitness_result: Any,
+    floor: float | None,
+    val_floor: float | None,
+) -> bool:
+    """train 已顶格满分时，val 严格升高才允许 apply。"""
+    if floor is None or val_floor is None:
+        return False
+    if fitness_result.score < _TRAIN_CAP or floor < _TRAIN_CAP:
+        return False
+    val_score = getattr(fitness_result, "val_score", None)
+    if val_score is None:
+        raise RuntimeError(
+            "val_floor 已启用但评估器未返回 val_score。"
+            "恢复：fitness_evaluator 使用 TrainValFitnessEvaluator"
+        )
+    return val_score > val_floor
+
+
+def _evaluation_from_fitness(
+    fitness_result: Any,
+    *,
+    passed: bool,
+    feedback: str | None = None,
+) -> EvaluationResult:
+    """把 FitnessResult 拷进 EvaluationResult（含 val）。"""
+    return EvaluationResult(
+        passed=passed,
+        score=fitness_result.score,
+        feedback=fitness_result.feedback if feedback is None else feedback,
+        test_result=None,
+        task_results=list(fitness_result.task_results),
+        val_score=getattr(fitness_result, "val_score", None),
+        val_task_results=list(getattr(fitness_result, "val_task_results", None) or []),
+    )
+
+
+def _restore_floors(agent: Any, target_generation: int, archived: Any) -> None:
+    """回滚后同步 train/val floor。未启用 fitness_floor 则不动。"""
+    if getattr(agent, "fitness_floor", None) is None:
+        return
+    if target_generation == 0:
+        baseline = getattr(agent, "baseline_fitness", None)
+        if baseline is None:
+            raise RuntimeError(
+                "fitness_floor 已启用但缺少 baseline_fitness。"
+                "恢复：真模型路径须在进化前写入 baseline_fitness"
+            )
+        agent.fitness_floor = baseline
+        if getattr(agent, "val_floor", None) is not None:
+            val_base = getattr(agent, "baseline_val_fitness", None)
+            if val_base is None:
+                raise RuntimeError(
+                    "val_floor 已启用但缺少 baseline_val_fitness。"
+                    "恢复：真模型路径须在进化前写入 baseline_val_fitness"
+                )
+            agent.val_floor = val_base
+        return
+    agent.fitness_floor = archived.evaluation.score
+    if getattr(agent, "val_floor", None) is not None:
+        val_score = getattr(archived.evaluation, "val_score", None)
+        if val_score is None:
+            raise RuntimeError(
+                "val_floor 已启用但归档缺少 val_score。"
+                "恢复：使用 TrainValFitnessEvaluator 再进化"
+            )
+        agent.val_floor = val_score
 
 
 def _build_evolution_prompt(
     snapshot: Any,
     fitness_history: list[str],
     archived_failures: list[str],
+    safety_clause: str | None = None,
 ) -> str:
     """构造 propose prompt（含 self_snapshot + fitness 历史 + archived_failures）。
 
@@ -150,6 +239,11 @@ def _build_evolution_prompt(
         f"## 工具定义\n{', '.join(t.get('name', '') for t in snapshot.tool_definitions)}",
         f"## 最近失败案例\n{chr(10).join(snapshot.recent_failures) if snapshot.recent_failures else '(无)'}",
     ]
+    if safety_clause is not None:
+        parts.append(
+            "# 安全句（必须原样出现在 proposed_value 中，一个字都不能改）\n"
+            + safety_clause
+        )
     if fitness_history:
         parts.append(
             "# Fitness 历史（反思依据）\n" + "\n".join(fitness_history)
@@ -158,10 +252,16 @@ def _build_evolution_prompt(
         parts.append(
             "# 已归档的失败提案（避免重复提议）\n" + "\n".join(archived_failures)
         )
+    keep = (
+        "proposed_value 必须原样包含安全句，删改安全句的提案会被拒绝。\n"
+        if safety_clause is not None
+        else ""
+    )
     parts.append(
         "# 任务\n"
         "基于以上状态和 fitness 历史，提出一个 system_prompt 改进提案。\n"
         "注意：只改 system_prompt（target_type='system_prompt'），不改架构层。\n"
+        f"{keep}"
         "只输出 JSON，不要附加任何解释文字：\n"
         "{\n"
         '  "target_type": "system_prompt",\n'
@@ -216,6 +316,8 @@ def evolve_prompt(agent: Any) -> EvolutionResult:
 
     Args:
         agent: 需 fitness_evaluator；建议有 archive_store。
+            若设置了 ``fitness_floor``，提案分数必须严格高于该值才 apply。
+            若设置了 ``safety_contract``，``proposed_value`` 必须原样包含该句。
 
     Returns:
         ``EvolutionResult``。
@@ -226,9 +328,12 @@ def evolve_prompt(agent: Any) -> EvolutionResult:
     snapshot = build_self_snapshot(agent)
     fitness_history = _extract_fitness_history(agent)
     archived_failures = _extract_archived_failures(agent)
+    safety_clause = _required_safety_clause(agent)
 
     # Step 1: 生成提案
-    prompt = _build_evolution_prompt(snapshot, fitness_history, archived_failures)
+    prompt = _build_evolution_prompt(
+        snapshot, fitness_history, archived_failures, safety_clause=safety_clause
+    )
     messages = [
         {
             "role": "system",
@@ -272,20 +377,46 @@ def evolve_prompt(agent: Any) -> EvolutionResult:
         diff_summary=data["diff_summary"],
     )
 
-    # Step 2: FitnessEvaluator 评估
+    # Step 2: 安全句硬门（在 fitness 之前，缺句不打任务集）
+    if safety_clause is not None and safety_clause not in proposal.proposed_value:
+        leakage_guard = getattr(agent, "leakage_guard", None)
+        if leakage_guard is None:
+            leakage_check = LeakageCheckResult(passed=True, matched_patterns=[])
+        else:
+            leakage_check = leakage_guard.check(proposal.proposed_value)
+        evaluation = EvaluationResult(
+            passed=False,
+            score=0.0,
+            feedback=(
+                f"{_SAFETY_DROP_PREFIX}：proposed_value 未原样包含安全句。"
+                f"{safety_clause}"
+            ),
+        )
+        applied = False
+        generation_for_archive = -1
+        archive_store = getattr(agent, "archive_store", None)
+        if archive_store is not None:
+            archive_store.add(proposal, evaluation, generation=generation_for_archive)
+        return EvolutionResult(
+            generation=agent.generation,
+            proposal=proposal,
+            evaluation=evaluation,
+            leakage_check=leakage_check,
+            applied=applied,
+        )
+
+    # Step 3: FitnessEvaluator 评估
     fitness_evaluator = getattr(agent, "fitness_evaluator", None)
     if fitness_evaluator is None:
         raise RuntimeError("agent.fitness_evaluator 未注入，无法评估 prompt 适应度")
     fitness_result = fitness_evaluator.evaluate(proposal.proposed_value)
 
-    evaluation = EvaluationResult(
+    evaluation = _evaluation_from_fitness(
+        fitness_result,
         passed=fitness_result.score >= FITNESS_THRESHOLD,
-        score=fitness_result.score,
-        feedback=fitness_result.feedback,
-        test_result=None,  # prompt 无测试执行（区别于 skill 的 exec 测试）
     )
 
-    # Step 3: LeakageGuard 检查（fitness 通过才检查）
+    # Step 4: LeakageGuard 检查
     leakage_guard = getattr(agent, "leakage_guard", None)
     if leakage_guard is None:
         # 未注入 LeakageGuard → 视为通过（不拦截）
@@ -293,23 +424,82 @@ def evolve_prompt(agent: Any) -> EvolutionResult:
     else:
         leakage_check = leakage_guard.check(proposal.proposed_value)
 
-    # Step 4: apply（fitness + leakage 都过才 apply）
+    # Step 5: apply（阈值 + leakage + train floor + 可选 val 不下降 / 满分时 val 升高）
     applied = False
-    if evaluation.passed and leakage_check.passed:
+    floor = getattr(agent, "fitness_floor", None)
+    val_floor = getattr(agent, "val_floor", None)
+    val_gain_at_cap = False
+    if (
+        evaluation.passed
+        and leakage_check.passed
+        and floor is not None
+        and fitness_result.score <= floor
+    ):
+        val_gain_at_cap = _val_improves_at_train_cap(
+            fitness_result, floor, val_floor
+        )
+    below_floor = (
+        floor is not None
+        and evaluation.passed
+        and leakage_check.passed
+        and fitness_result.score <= floor
+        and not val_gain_at_cap
+    )
+    val_dropped = False
+    if val_floor is not None and not below_floor:
+        if getattr(fitness_result, "val_score", None) is None:
+            raise RuntimeError(
+                "val_floor 已启用但评估器未返回 val_score。"
+                "恢复：fitness_evaluator 使用 TrainValFitnessEvaluator"
+            )
+        val_dropped = (
+            evaluation.passed
+            and leakage_check.passed
+            and fitness_result.val_score < val_floor
+        )
+    if below_floor:
+        at_cap = (
+            floor is not None
+            and val_floor is not None
+            and floor >= _TRAIN_CAP
+            and fitness_result.score >= _TRAIN_CAP
+        )
+        prefix = _CAP_NO_VAL_GAIN_PREFIX if at_cap else _NO_IMPROVEMENT_PREFIX
+        evaluation = _evaluation_from_fitness(
+            fitness_result,
+            passed=False,
+            feedback=(
+                f"{prefix} {floor:.3f}（提案 {fitness_result.score:.3f}）。"
+                f"{fitness_result.feedback}"
+            ),
+        )
+    elif val_dropped:
+        evaluation = _evaluation_from_fitness(
+            fitness_result,
+            passed=False,
+            feedback=(
+                f"{_VAL_DROP_PREFIX} {val_floor:.3f} → {fitness_result.val_score:.3f}。"
+                f"{fitness_result.feedback}"
+            ),
+        )
+    elif evaluation.passed and leakage_check.passed:
         apply_diff(agent, proposal)
         agent.generation += 1
         applied = True
+        if floor is not None:
+            agent.fitness_floor = fitness_result.score
+        if val_floor is not None:
+            agent.val_floor = fitness_result.val_score
     elif evaluation.passed and not leakage_check.passed:
         # fitness 过但 leakage 命中 → 覆盖 evaluation 为 failed
         matched = ", ".join(leakage_check.matched_patterns)
-        evaluation = EvaluationResult(
+        evaluation = _evaluation_from_fitness(
+            fitness_result,
             passed=False,
-            score=fitness_result.score,
             feedback=f"leakage detected: 命中模式 [{matched}]",
-            test_result=None,
         )
 
-    # Step 5: archive（无论通过与否）
+    # Step 6: archive（无论通过与否）
     # apply 成功时传新代号（agent.generation 是新代），失败传 -1
     generation_for_archive = agent.generation if applied else -1
     current_generation = agent.generation
@@ -355,6 +545,7 @@ def rollback_to(agent: Any, target_generation: int) -> None:
             # 没有第 1 代通过记录 → 说明没进化过，无需回滚
             if agent.generation != 0:
                 agent.generation = 0
+            _restore_floors(agent, 0, None)
             return
         value_to_apply = archived.proposal.current_value
     else:
@@ -377,6 +568,7 @@ def rollback_to(agent: Any, target_generation: int) -> None:
 
     # Q7=A：generation 同步回退
     agent.generation = target_generation
+    _restore_floors(agent, target_generation, archived)
 
 
 # =============================================================

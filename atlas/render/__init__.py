@@ -12,11 +12,12 @@
     renderer = RichRenderer()
 """
 from .base import Renderer
-from .plain import PlainRenderer
+from .plain import PlainRenderer, SilentRenderer
 from .rich import RichRenderer
 
 __all__ = [
     "Renderer",
     "PlainRenderer",
+    "SilentRenderer",
     "RichRenderer",
 ]

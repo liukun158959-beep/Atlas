@@ -55,3 +55,31 @@ class PlainRenderer:
         print(fmt.format(*["-" * w for w in col_widths]))  # noqa: T201
         for row in rows:
             print(fmt.format(*[str(row.get(h, "")) for h in headers]))  # noqa: T201
+
+
+class SilentRenderer:
+    """不往终端输出。任务集打分 / ab_test 用。"""
+
+    name = "silent"
+
+    def print(self, *args: object, **kwargs: object) -> None:
+        return
+
+    def rule(self, title: str = "") -> None:
+        return
+
+    def markdown(self, text: str, title: str | None = None) -> None:
+        return
+
+    def panel(
+        self,
+        content: str,
+        title: str,
+        *,
+        border_style: str = "blue",
+        **meta: str,
+    ) -> None:
+        return
+
+    def table(self, rows: list[dict], headers: list[str], title: str | None = None) -> None:
+        return

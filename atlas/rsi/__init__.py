@@ -14,8 +14,10 @@ Phase 4.2a 自进化闭环（修改层）：
 
 Phase 4.2b Prompt 进化（反思式变异 + 适应度 + Leakage Guardrails）：
 - FitnessEvaluator + FitnessResult + FakeFitnessEvaluator（适应度评估）
+- TaskSetFitnessEvaluator / TrainValFitnessEvaluator / CodeFitnessEvaluator / MultiTurnFitnessEvaluator
 - LeakageGuard + LeakageCheckResult + RegexLeakageGuard（越狱防护）
 - EvolutionResult + evolve_prompt（Prompt 进化闭环）
+- export_evolution_report（Phase 5.1：进化报告 Markdown 导出）
 """
 from __future__ import annotations
 
@@ -30,8 +32,21 @@ from .evolver import (
     self_evolve,
 )
 from .failure import FailureCase, FailureMemory, FailureMemoryCollector
-from .fitness import FakeFitnessEvaluator, FitnessEvaluator, FitnessResult, TaskSetFitnessEvaluator
+from .fitness import (
+    FakeFitnessEvaluator,
+    FitnessEvaluator,
+    FitnessResult,
+    TaskSetFitnessEvaluator,
+    TrainValFitnessEvaluator,
+)
+from .code_fitness import CodeFitnessEvaluator
+from .multiturn_fitness import MultiTurnFitnessEvaluator
 from .inspector import SelfSnapshot, build_self_snapshot
+from .evolution_report import export_evolution_report
+from .ab_test import AbTestResult, ab_test_prompts
+from .mathtrap_tasks import MATHTRAP_TRAIN, MATHTRAP_VAL, mathtrap_all_tasks
+from .humaneval_tasks import HUMANEVAL_TRAIN, HUMANEVAL_VAL, humaneval_all_tasks
+from .multiturn_tasks import MULTITURN_TRAIN, MULTITURN_VAL, multiturn_all_tasks
 from .prompt_evolver import (
     EvolutionResult,
     EvolutionSummary,
@@ -81,6 +96,20 @@ __all__ = [
     "FitnessResult",
     "FakeFitnessEvaluator",
     "TaskSetFitnessEvaluator",
+    "TrainValFitnessEvaluator",
+    "CodeFitnessEvaluator",
+    "MultiTurnFitnessEvaluator",
+    "AbTestResult",
+    "ab_test_prompts",
+    "MATHTRAP_TRAIN",
+    "MATHTRAP_VAL",
+    "mathtrap_all_tasks",
+    "HUMANEVAL_TRAIN",
+    "HUMANEVAL_VAL",
+    "humaneval_all_tasks",
+    "MULTITURN_TRAIN",
+    "MULTITURN_VAL",
+    "multiturn_all_tasks",
     # Phase 4.2b：Leakage Guardrails
     "LeakageGuard",
     "LeakageCheckResult",
@@ -92,4 +121,5 @@ __all__ = [
     "EvolutionSummary",
     "evolve_prompt_until_converged",
     "rollback_to",
+    "export_evolution_report",
 ]

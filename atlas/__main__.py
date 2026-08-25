@@ -4,6 +4,7 @@
     init       项目初始化（创建 venv + 安装依赖 + 配置 .env）
     dashboard  启动极简 Dashboard（HTTP + WebSocket 实时面板）
     run        从 YAML 配置运行 / resume Agent
+    ab_test    同一任务集对比两个 system prompt（均值 + 样本标准差）
 """
 from __future__ import annotations
 
@@ -42,6 +43,11 @@ def _print_usage() -> int:
     print("                --config <path>   配置文件（必需）")
     print("                --resume <run_id> 从 Journal 续跑")
     print("                --plain           纯文本输出")
+    print("  ab_test    同一任务集对比两个 prompt")
+    print("                --preset mathtrap | humaneval | multiturn")
+    print("                --prompt-a <file> --prompt-b <file>")
+    print("                --n <int>         轮数（默认 3）")
+    print("                --mock            不调真模型")
     return 1
 
 
@@ -68,6 +74,11 @@ def main() -> int:
         from .cli.run import run as run_cmd
 
         return run_cmd(sub_argv)
+
+    if command == "ab_test":
+        from .cli.ab_test import run as ab_test_cmd
+
+        return ab_test_cmd(sub_argv)
 
     print(f"未知子命令: {command}")
     return _print_usage()

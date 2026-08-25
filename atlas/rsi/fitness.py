@@ -8,19 +8,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+# 写入 task_results 的输出截断长度（看板与反馈共用）
+_OUTPUT_PREVIEW_CHARS = 400
+
 
 @dataclass
 class FitnessResult:
     """适应度评估结果。
 
-    score: 0.0-1.0 浮点数
+    score: 0.0-1.0 浮点数（train；apply 比较用这个）
     feedback: 评估反馈文本（供反思式变异注入下一代 propose prompt）
-    task_results: 每个任务的详细结果（真实实现填，Fake 留空）
+    task_results: 训练题详情
+    val_score / val_task_results: 验证集；未拆分时为 None / 空
     """
 
     score: float
     feedback: str = ""
     task_results: list[dict] = field(default_factory=list)
+    val_score: float | None = None
+    val_task_results: list[dict] = field(default_factory=list)
 
 
 @runtime_checkable
@@ -85,6 +91,7 @@ class TaskSetFitnessEvaluator:
                 "task": "用户输入文本",
                 "expected_schema": {...},      # 可选，JSON Schema 校验
                 "expected_keywords": ["关键字"], # 可选，需全部命中
+                "failure_hint": "失败时写入 feedback 的方法说明",  # 可选；有则不再把缺失关键字原文塞进反馈
             },
             ...
         ]
@@ -101,8 +108,8 @@ class TaskSetFitnessEvaluator:
         self._task_set = task_set
         self._agent_factory = agent_factory
 
-    def _evaluate_single(self, agent: Any, task: dict) -> tuple[float, str]:
-        """评估单个任务：跑 Agent → schema + 关键字检查。返回 (score, feedback)。"""
+    def _evaluate_single(self, agent: Any, task: dict) -> tuple[float, str, str]:
+        """评估单个任务：跑 Agent → schema + 关键字检查。返回 (score, feedback, 输出原文)。"""
         user_input = task["task"]
         expected_schema = task.get("expected_schema")
         expected_keywords = task.get("expected_keywords", [])
@@ -117,15 +124,18 @@ class TaskSetFitnessEvaluator:
             from ..patterns._common import _validate_artifact_schema
             schema_ok, schema_err = _validate_artifact_schema(artifact, expected_schema)
             if not schema_ok:
-                return (0.0, f"schema 校验失败: {schema_err}")
+                return (0.0, f"schema 校验失败: {schema_err}", artifact)
 
         # 关键字命中检查
         if expected_keywords:
             missing = [kw for kw in expected_keywords if kw not in artifact]
             if missing:
-                return (0.0, f"关键字缺失: {missing}")
+                hint = task.get("failure_hint")
+                if hint:
+                    return (0.0, hint, artifact)
+                return (0.0, f"关键字缺失: {missing}", artifact)
 
-        return (1.0, "通过")
+        return (1.0, "通过", artifact)
 
     def evaluate(self, prompt: str) -> FitnessResult:
         """在任务集上评估 prompt，返回 FitnessResult。"""
@@ -134,12 +144,16 @@ class TaskSetFitnessEvaluator:
         passed_count = 0
 
         for idx, task in enumerate(self._task_set):
-            score, feedback = self._evaluate_single(agent, task)
+            score, feedback, artifact = self._evaluate_single(agent, task)
+            output = artifact if len(artifact) <= _OUTPUT_PREVIEW_CHARS else (
+                artifact[:_OUTPUT_PREVIEW_CHARS] + "..."
+            )
             task_results.append({
                 "task_idx": idx,
                 "task": task["task"],
                 "score": score,
                 "feedback": feedback,
+                "output": output,
             })
             if score >= 1.0:
                 passed_count += 1
@@ -155,4 +169,45 @@ class TaskSetFitnessEvaluator:
             score=avg_score,
             feedback=feedback,
             task_results=task_results,
+        )
+
+
+class TrainValFitnessEvaluator:
+    """训练题打 apply 用的分，验证题只检测过拟合，不参与提案刷分。
+
+    inner_cls 默认 TaskSetFitnessEvaluator；编码题传入 CodeFitnessEvaluator。
+    """
+
+    def __init__(
+        self,
+        train_set: list[dict],
+        val_set: list[dict],
+        agent_factory: object,
+        inner_cls: type = TaskSetFitnessEvaluator,
+    ) -> None:
+        if not train_set:
+            raise ValueError("train_set 不能为空。恢复：传入至少 1 道训练题")
+        if not val_set:
+            raise ValueError("val_set 不能为空。恢复：传入至少 1 道验证题")
+        self._train = inner_cls(train_set, agent_factory)
+        self._val = inner_cls(val_set, agent_factory)
+
+    def evaluate(self, prompt: str) -> FitnessResult:
+        train = self._train.evaluate(prompt)
+        val = self._val.evaluate(prompt)
+        feedback = (
+            f"train {train.feedback}\n"
+            f"val 通过 {sum(1 for r in val.task_results if r['score'] >= 1.0)}"
+            f"/{len(val.task_results)} = {val.score:.3f}：\n"
+            + "\n".join(
+                f"  val[{r['task_idx']}] score={r['score']:.1f} {r['feedback']}"
+                for r in val.task_results
+            )
+        )
+        return FitnessResult(
+            score=train.score,
+            feedback=feedback,
+            task_results=train.task_results,
+            val_score=val.score,
+            val_task_results=val.task_results,
         )
