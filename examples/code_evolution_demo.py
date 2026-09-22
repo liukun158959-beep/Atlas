@@ -403,6 +403,39 @@ def _run_real() -> None:
     print("DashScope 走系统代理会 TLS 超时。真跑前设置: $env:NO_PROXY='*'; $env:no_proxy='*'")
 
 
+def _print_attempts(label: str, rows: list[dict]) -> None:
+    """把每题每次尝试的模型原文打出来，不只打分数。"""
+    print(f"---- {label} ----")
+    if not rows:
+        print("  (无 task_results)")
+        return
+    for r in rows:
+        name = r.get("func_name") or r.get("task", "")[:40]
+        print(f"  题[{r.get('task_idx')}] {name}  score={r.get('score')}")
+        attempts = r.get("attempts") or []
+        if not attempts:
+            print("    (无 attempts，只存了最后一截 output)")
+            print("    --- 最后输出 ---")
+            print(r.get("output") or "")
+            print("    ---")
+            continue
+        for a in attempts:
+            mark = "通过" if a.get("ok") else "未过"
+            print(f"    尝试{a.get('n')} {mark}  reason={a.get('reason')}")
+            print("    --- 模型原文 ---")
+            print(a.get("text") or "")
+            print("    ---")
+
+
+def _print_proposal(result: object) -> None:
+    p = result.proposal
+    print("    --- 提案 proposed_value 全文 ---")
+    print(p.proposed_value)
+    print("    ---")
+    print(f"    reasoning: {p.reasoning}")
+    print(f"    diff_summary: {p.diff_summary}")
+
+
 def _run_evolve_real(max_generations: int) -> None:
     from dotenv import load_dotenv
 
@@ -423,12 +456,16 @@ def _run_evolve_real(max_generations: int) -> None:
         f"  基线 train {n_train} + val {n_val} 题；"
         f"每代约 {1 + n_train + n_val} 次 LLM 调用，最多 {max_generations} 代。"
     )
+    print("  初始 system prompt:")
+    print(EVOLVE_INITIAL)
     agent, evaluator = _build_evolve_agent(llm)
     print("  正在评估当前 prompt 基线（train + val）...")
     baseline = evaluator.evaluate(EVOLVE_INITIAL)
     if baseline.val_score is None:
         raise RuntimeError("基线缺少 val_score。恢复：使用 TrainValFitnessEvaluator")
     print(f"  基线 train={baseline.score:.3f} val={baseline.val_score:.3f}")
+    _print_attempts("基线 TRAIN 模型原文", baseline.task_results)
+    _print_attempts("基线 VAL 模型原文", baseline.val_task_results)
     agent.baseline_fitness = baseline.score
     agent.fitness_floor = baseline.score
     agent.baseline_val_fitness = baseline.val_score
@@ -449,7 +486,9 @@ def _run_evolve_real(max_generations: int) -> None:
             f"    {tag} train={result.evaluation.score:.3f}{val_txt} "
             f"gen={result.generation} {result.proposal.diff_summary[:80]}"
         )
-        print(f"    feedback: {result.evaluation.feedback[:280].replace(chr(10), ' / ')}")
+        _print_proposal(result)
+        _print_attempts(f"第 {i + 1} 代 TRAIN 模型原文", result.evaluation.task_results)
+        _print_attempts(f"第 {i + 1} 代 VAL 模型原文", result.evaluation.val_task_results)
 
     print()
     print("真跑进化不设分数断言。期望至少 1 次 apply；安全句必须保住。")
@@ -459,6 +498,8 @@ def _run_evolve_real(max_generations: int) -> None:
         raise RuntimeError(
             "最终 prompt 丢失安全句。恢复：检查 safety_contract 硬门是否被关掉"
         )
+    print("  最终 system prompt:")
+    print(sys_now)
     print(f"  最终 generation={agent.generation} 安全句仍在")
 
 

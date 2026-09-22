@@ -67,17 +67,24 @@ class CodeFitnessEvaluator:
         self._task_set = task_set
         self._agent_factory = agent_factory
 
-    def _evaluate_single(self, agent: Any, task: dict) -> tuple[float, str, str]:
+    def _evaluate_single(self, agent: Any, task: dict) -> tuple[float, str, str, list[dict]]:
         func_name = task["func_name"]
         hint = task.get("failure_hint") or "抽不出可执行 Python 或沙箱测试未通过"
         user_input = task["task"]
         artifact = ""
+        attempts: list[dict] = []
 
         for attempt in range(_MAX_ATTEMPTS):
             result = agent.run(user_input)
             artifact = result if isinstance(result, str) else str(result)
             code = extract_python_block(artifact, func_name)
             if code is None:
+                attempts.append({
+                    "n": attempt + 1,
+                    "ok": False,
+                    "reason": "没有抽出可执行函数",
+                    "text": artifact,
+                })
                 user_input = _repair_user_message(
                     func_name,
                     f"没有抽出可执行的 {func_name}。",
@@ -86,11 +93,23 @@ class CodeFitnessEvaluator:
             try:
                 run_function_cases_in_sandbox(code, func_name, task["cases"])
             except ValueError as exc:
+                attempts.append({
+                    "n": attempt + 1,
+                    "ok": False,
+                    "reason": str(exc),
+                    "text": artifact,
+                })
                 user_input = _repair_user_message(func_name, str(exc))
                 continue
-            return (1.0, "通过", artifact)
+            attempts.append({
+                "n": attempt + 1,
+                "ok": True,
+                "reason": "通过",
+                "text": artifact,
+            })
+            return (1.0, "通过", artifact, attempts)
 
-        return (0.0, hint, artifact)
+        return (0.0, hint, artifact, attempts)
 
     def evaluate(self, prompt: str) -> FitnessResult:
         """在编码任务集上评估 prompt，返回 FitnessResult。每题新建 Agent。"""
@@ -99,16 +118,18 @@ class CodeFitnessEvaluator:
 
         for idx, task in enumerate(self._task_set):
             agent = self._agent_factory(prompt)
-            score, feedback, artifact = self._evaluate_single(agent, task)
+            score, feedback, artifact, attempts = self._evaluate_single(agent, task)
             output = artifact if len(artifact) <= _OUTPUT_PREVIEW_CHARS else (
                 artifact[:_OUTPUT_PREVIEW_CHARS] + "..."
             )
             task_results.append({
                 "task_idx": idx,
                 "task": task["task"],
+                "func_name": task["func_name"],
                 "score": score,
                 "feedback": feedback,
                 "output": output,
+                "attempts": attempts,
             })
             if score >= 1.0:
                 passed_count += 1
