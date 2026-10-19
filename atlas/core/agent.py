@@ -13,7 +13,7 @@ from ..context.trace import Trace
 from ..context.transcript import Transcript
 from ..journal.base import JournalProtocol
 from ..journal.sqlite import SQLiteJournal
-from ..llm.base import LLM
+from ..llm.contract import ChatModel
 from ..memory.base import Memory
 from ..render import PlainRenderer, Renderer
 from ..tools.base import Toolkit
@@ -44,7 +44,7 @@ class Agent:
 
     def __init__(
         self,
-        llm: LLM,
+        llm: ChatModel,
         tools: Toolkit,
         system_prompt: str | None = None,
         runtime: Runtime | None = None,

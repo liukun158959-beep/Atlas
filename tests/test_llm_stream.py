@@ -131,11 +131,12 @@ def test_complete_tool_call_preserves_fragmented_arguments(model_stream):
 
 
 @pytest.mark.parametrize("arguments", ['{"value":', '{"value":1}'])
-def test_unfinished_tool_stream_cannot_execute_or_finish_agent(model_stream, arguments):
+@pytest.mark.parametrize("finish", [None, "length", "content_filter"])
+def test_unfinished_tool_stream_cannot_execute_or_finish_agent(model_stream, arguments, finish):
     llm, body, requests = model_stream([chunk({"tool_calls": [{
         "index": 0, "id": "call-1", "type": "function",
         "function": {"name": "record", "arguments": arguments},
-    }]})])
+    }]}, finish)])
     calls = []
     tools = Toolkit()
     tools.register(

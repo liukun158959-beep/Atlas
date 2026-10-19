@@ -17,7 +17,11 @@ def _run_demo(filename: str, args: list[str]) -> None:
     sys.argv = [str(path), *args]
     sys.path.insert(0, str(EXAMPLES))
     try:
-        runpy.run_path(str(path), run_name="__main__")
+        try:
+            runpy.run_path(str(path), run_name="__main__")
+        except SystemExit as error:
+            if error.code not in (None, 0):
+                raise
     finally:
         sys.argv = old
         if str(EXAMPLES) in sys.path:
@@ -34,6 +38,7 @@ def _run_demo(filename: str, args: list[str]) -> None:
         ("circuit_retry_demo.py", ["--mock", "--plain"]),
         ("suspend_resume_demo.py", ["--plain"]),
         ("agent_resume_demo.py", []),
+        ("llm_contract_demo.py", ["--mock"]),
     ],
 )
 def test_core_demos(filename: str, args: list[str], monkeypatch, tmp_path) -> None:

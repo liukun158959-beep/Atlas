@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from atlas.context.trace import Trace
-    from atlas.llm.base import LLM
+    from atlas.llm.contract import ChatModel
 
 
 # 9 段 Summary 模板
@@ -49,7 +49,7 @@ class CompactManager:
     由 AgentLoop 在每次 LLM 调用后调用 apply()。
     """
 
-    def __init__(self, threshold: int = 8000, llm: "LLM | None" = None) -> None:
+    def __init__(self, threshold: int = 8000, llm: "ChatModel | None" = None) -> None:
         self.threshold = threshold
         self.llm = llm
         self.llm_calls: int = 0

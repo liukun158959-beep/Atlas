@@ -1,4 +1,4 @@
-"""LLM 接入层：基于 OpenAI 兼容协议，可对接 Qwen / Deepseek / OpenAI 等。"""
+"""OpenAI-compatible transport and response assembly; no Agent dependencies."""
 from __future__ import annotations
 
 import os
@@ -8,146 +8,193 @@ from typing import Any
 from openai import OpenAI
 
 from ..providers import PROVIDERS
+from .contract import (ChatCallbacks, ChatCancelledError, ChatOptions, ChatResult,
+                       IncompleteResponseError)
 
 
 class LLM:
-    """OpenAI 兼容协议的模型客户端。
+    """Model client. Explicit configuration overrides environment and presets.
 
-    配置优先级：显式参数 > provider 预设 > 环境变量
-        provider       - 预设 provider key（如 "qwen"），自动填充 base_url 与默认 model
-        api_key        - 模型服务 API Key
-        base_url       - 服务地址（覆盖 provider 预设）
-        model          - 模型名（覆盖 provider 预设）
-
-    环境变量（由 `python -m atlas init` 写入 .env）：
-        ATLAS_API_KEY  - 模型服务 API Key
-        ATLAS_BASE_URL - 服务地址
-        ATLAS_MODEL    - 默认模型名
+    Injected SDK clients are borrowed. Internally created clients disable retries
+    and are owned by this instance. Use bind_client for explicit replacement.
     """
 
-    def __init__(
-        self,
-        model: str | None = None,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        provider: str | None = None,
-    ) -> None:
-        # provider 预设作为初值，显式参数与环境变量优先级更高
+    def __init__(self, model: str | None = None, api_key: str | None = None,
+                 base_url: str | None = None, provider: str | None = None,
+                 *, client: OpenAI | None = None) -> None:
         preset = PROVIDERS.get(provider or "", {})
-        self.model = (
-            model
-            or os.getenv("ATLAS_MODEL")
-            or preset.get("default_model")
-            or "qwen-plus"
-        )
-        self.client = OpenAI(
+        self.model = model or os.getenv("ATLAS_MODEL") or preset.get("default_model") or "qwen-plus"
+        self.client = client if client is not None else OpenAI(
             api_key=api_key or os.getenv("ATLAS_API_KEY"),
             base_url=base_url or os.getenv("ATLAS_BASE_URL") or preset.get("base_url"),
+            max_retries=0,
         )
+        self._owns_client = client is None
+        self._closed = False
+        # Backwards-compatible defaults for existing single-owner callers.
+        # New integrations pass per-call options/callbacks instead.
+        self.sampling: dict[str, Any] | None = None
+        self.on_reasoning = None
+        self.on_progress = None
+        self.on_tool_delta = None
 
-    def chat(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        on_delta: Any | None = None,
-    ) -> dict:
-        """调用对话接口，返回 {message, usage, duration_ms}。
+    def bind_client(self, client: OpenAI, *, model: str | None = None,
+                    owned: bool = False) -> None:
+        if client is not self.client and self._owns_client:
+            self.client.close()
+        self.client = client
+        self._owns_client = owned
+        self._closed = False
+        if model is not None:
+            self.model = model
 
-        Args:
-            messages: OpenAI 格式消息列表（通常来自 ``Memory.messages``）。
-            tools: OpenAI tools schema；None 表示不传工具。
-            on_delta: 若传入则 stream=True，每段 content 回调一次；
-                tool_calls 只在内部拼完整。
+    def close(self) -> None:
+        if not self._closed and self._owns_client:
+            self.client.close()
+        self._closed = True
 
-        Returns:
-            dict：message / usage（可能 None）/ duration_ms。
+    def __enter__(self):
+        return self
 
-        Raises:
-            RuntimeError: 流结束时缺少 finish_reason，片段不会作为完整结果返回。
+    def __exit__(self, *args):
+        self.close()
 
-        依赖:
-            OpenAI 兼容 HTTP；流式时 ``stream_options.include_usage``。
-            由 ``AgentLoop`` 与 RSI ``propose_diff`` / ``evolve_prompt`` 调用。
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             on_delta: Any | None = None, *, options: ChatOptions | None = None,
+             callbacks: ChatCallbacks | None = None) -> ChatResult:
+        """Return {message, usage, duration_ms} only after stop/tool_calls.
+
+        The three-argument API is unchanged: a text callback enables streaming.
+        Options/callbacks replace instance defaults for this call only. Explicit
+        stream=True supports tool-only streams without a text callback.
+        IncompleteResponseError/ChatCancelledError carry a partial ChatResult.
+        SDK, transport and callback exceptions propagate without retries.
         """
+        if self._closed:
+            raise RuntimeError("LLM client is closed")
+        options = options if options is not None else ChatOptions(sampling=self.sampling)
+        callbacks = callbacks if callbacks is not None else ChatCallbacks(
+            on_delta=on_delta, on_reasoning=self.on_reasoning,
+            on_progress=self.on_progress, on_tool_delta=self.on_tool_delta,
+        )
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
-        start_ts = time.time()
-        if on_delta is None:
-            response = self.client.chat.completions.create(**kwargs)
-            duration_ms = int((time.time() - start_ts) * 1000)
-            message = response.choices[0].message.model_dump(exclude_none=True)
-            usage = None
-            if hasattr(response, "usage") and response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-            return {"message": message, "usage": usage, "duration_ms": duration_ms}
-        return self._chat_stream(kwargs, on_delta, start_ts)
+        kwargs.update(_sampling_kwargs(options))
+        start = time.monotonic()
+        empty = _result({"role": "assistant", "content": None}, None, start)
+        _check_cancel(options, empty)
+        streaming = options.stream if options.stream is not None else callbacks.on_delta is not None
+        if streaming:
+            return self._chat_stream(kwargs, options, callbacks, start)
+        response = self.client.chat.completions.create(**kwargs)
+        choice = next((c for c in response.choices if c.index in (None, 0)), None)
+        message = choice.message.model_dump(exclude_none=True) if choice else empty["message"]
+        if not options.preserve_reasoning:
+            message.pop("reasoning_content", None)
+        result = _result(message, _usage(response), start)
+        _check_cancel(options, result)
+        _check_finish(choice.finish_reason if choice else None, result)
+        return result
 
-    def _chat_stream(
-        self,
-        kwargs: dict[str, Any],
-        on_delta: Any,
-        start_ts: float,
-    ) -> dict:
-        stream = self.client.chat.completions.create(
-            **kwargs,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-        content_parts: list[str] = []
-        tool_acc: dict[int, dict] = {}
+    def _chat_stream(self, kwargs: dict[str, Any], options: ChatOptions,
+                     callbacks: ChatCallbacks, start: float) -> ChatResult:
+        content: list[str] = []
+        reasoning: list[str] = []
+        calls: dict[int, dict] = {}
         usage = None
-        finished = False
-        with stream:
+        finish = None
+
+        def result():
+            message: dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
+            if calls:
+                message["tool_calls"] = [dict(id=calls[i]["id"], type="function",
+                                              function=dict(calls[i]["function"])) for i in sorted(calls)]
+            if options.preserve_reasoning and reasoning:
+                message["reasoning_content"] = "".join(reasoning)
+            return _result(message, usage, start)
+
+        def check_cancel():
+            if options.should_cancel is not None and options.should_cancel():
+                raise ChatCancelledError(result())
+
+        with self.client.chat.completions.create(
+            **kwargs, stream=True, stream_options={"include_usage": True},
+        ) as stream:
             for chunk in stream:
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage:
-                    usage = {
-                        "prompt_tokens": chunk_usage.prompt_tokens,
-                        "completion_tokens": chunk_usage.completion_tokens,
-                        "total_tokens": chunk_usage.total_tokens,
-                    }
-                if not chunk.choices:
-                    continue
-                choice = chunk.choices[0]
-                if choice.finish_reason is not None:
-                    finished = True
-                delta = choice.delta
-                piece = getattr(delta, "content", None)
-                if piece:
-                    content_parts.append(piece)
-                    on_delta(piece)
-                for call in getattr(delta, "tool_calls", None) or []:
-                    slot = tool_acc.setdefault(
-                        call.index,
-                        {
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        },
-                    )
-                    if call.id:
-                        slot["id"] = call.id
-                    fn = call.function
-                    if fn is None:
+                check_cancel()
+                if getattr(chunk, "usage", None):
+                    usage = _usage(chunk)
+                for choice in chunk.choices:
+                    if choice.index not in (None, 0):
                         continue
-                    if fn.name:
-                        slot["function"]["name"] += fn.name
-                    if fn.arguments:
-                        slot["function"]["arguments"] += fn.arguments
-        if not finished:
-            raise RuntimeError(
-                "模型流提前结束，未收到 finish_reason 完成信息；已接收片段不能视为完整结果。"
-            )
-        duration_ms = int((time.time() - start_ts) * 1000)
-        message: dict[str, Any] = {
-            "role": "assistant",
-            "content": "".join(content_parts) or None,
-        }
-        if tool_acc:
-            message["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc)]
-        return {"message": message, "usage": usage, "duration_ms": duration_ms}
+                    if choice.finish_reason is not None:
+                        finish = choice.finish_reason
+                    delta = choice.delta
+                    thought = _delta_text(delta, "reasoning_content")
+                    if thought:
+                        if options.preserve_reasoning:
+                            reasoning.append(thought)
+                        if callbacks.on_reasoning:
+                            callbacks.on_reasoning(thought)
+                    piece = _delta_text(delta, "content")
+                    if piece:
+                        content.append(piece)
+                        if callbacks.on_delta:
+                            callbacks.on_delta(piece)
+                    for call in getattr(delta, "tool_calls", None) or []:
+                        if callbacks.on_progress:
+                            callbacks.on_progress()
+                        slot = calls.setdefault(call.index, dict(
+                            id="", type="function", function=dict(name="", arguments=""),
+                        ))
+                        if call.id:
+                            slot["id"] = call.id
+                        if call.function:
+                            for field in ("name", "arguments"):
+                                slot["function"][field] += getattr(call.function, field, None) or ""
+                        if callbacks.on_tool_delta:
+                            callbacks.on_tool_delta(call.index, slot["function"]["name"],
+                                                    slot["function"]["arguments"])
+                    check_cancel()
+            complete = result()
+            _check_cancel(options, complete)
+            _check_finish(finish, complete)
+        return complete
+
+
+def _check_finish(finish: str | None, partial: ChatResult) -> None:
+    if finish not in {"stop", "tool_calls"}:
+        raise IncompleteResponseError(finish, partial)
+
+
+def _check_cancel(options: ChatOptions, partial: ChatResult) -> None:
+    if options.should_cancel is not None and options.should_cancel():
+        raise ChatCancelledError(partial)
+
+
+def _result(message: dict, usage: dict | None, start: float) -> ChatResult:
+    return dict(message=message, usage=usage, duration_ms=int((time.monotonic() - start) * 1000))
+
+
+def _usage(response: Any) -> dict | None:
+    usage = getattr(response, "usage", None)
+    return usage.model_dump(exclude_none=True) if usage is not None else None
+
+
+def _sampling_kwargs(options: ChatOptions) -> dict[str, Any]:
+    sampling = options.sampling or {}
+    kwargs = {key: sampling[key] for key in ("temperature", "top_p") if key in sampling}
+    body: dict[str, Any] = {}
+    if "reasoning_effort" in sampling:
+        body.update(thinking={"type": "enabled"}, reasoning_effort=sampling["reasoning_effort"])
+    for key, value in (options.extra_body or {}).items():
+        body[key] = {**body.get(key, {}), **value} if key == "thinking" and isinstance(value, dict) else value
+    if body:
+        kwargs["extra_body"] = body
+    return kwargs
+
+
+def _delta_text(delta: Any, key: str) -> str | None:
+    direct = getattr(delta, key, None)
+    return direct if isinstance(direct, str) and direct else None
