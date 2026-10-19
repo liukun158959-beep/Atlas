@@ -62,6 +62,9 @@ class LLM:
         Returns:
             dict：message / usage（可能 None）/ duration_ms。
 
+        Raises:
+            RuntimeError: 流结束时缺少 finish_reason，片段不会作为完整结果返回。
+
         依赖:
             OpenAI 兼容 HTTP；流式时 ``stream_options.include_usage``。
             由 ``AgentLoop`` 与 RSI ``propose_diff`` / ``evolve_prompt`` 调用。
@@ -98,39 +101,48 @@ class LLM:
         content_parts: list[str] = []
         tool_acc: dict[int, dict] = {}
         usage = None
-        for chunk in stream:
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage:
-                usage = {
-                    "prompt_tokens": chunk_usage.prompt_tokens,
-                    "completion_tokens": chunk_usage.completion_tokens,
-                    "total_tokens": chunk_usage.total_tokens,
-                }
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
-            if piece:
-                content_parts.append(piece)
-                on_delta(piece)
-            for call in getattr(delta, "tool_calls", None) or []:
-                slot = tool_acc.setdefault(
-                    call.index,
-                    {
-                        "id": "",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""},
-                    },
-                )
-                if call.id:
-                    slot["id"] = call.id
-                fn = call.function
-                if fn is None:
+        finished = False
+        with stream:
+            for chunk in stream:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage:
+                    usage = {
+                        "prompt_tokens": chunk_usage.prompt_tokens,
+                        "completion_tokens": chunk_usage.completion_tokens,
+                        "total_tokens": chunk_usage.total_tokens,
+                    }
+                if not chunk.choices:
                     continue
-                if fn.name:
-                    slot["function"]["name"] += fn.name
-                if fn.arguments:
-                    slot["function"]["arguments"] += fn.arguments
+                choice = chunk.choices[0]
+                if choice.finish_reason is not None:
+                    finished = True
+                delta = choice.delta
+                piece = getattr(delta, "content", None)
+                if piece:
+                    content_parts.append(piece)
+                    on_delta(piece)
+                for call in getattr(delta, "tool_calls", None) or []:
+                    slot = tool_acc.setdefault(
+                        call.index,
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    if call.id:
+                        slot["id"] = call.id
+                    fn = call.function
+                    if fn is None:
+                        continue
+                    if fn.name:
+                        slot["function"]["name"] += fn.name
+                    if fn.arguments:
+                        slot["function"]["arguments"] += fn.arguments
+        if not finished:
+            raise RuntimeError(
+                "模型流提前结束，未收到 finish_reason 完成信息；已接收片段不能视为完整结果。"
+            )
         duration_ms = int((time.time() - start_ts) * 1000)
         message: dict[str, Any] = {
             "role": "assistant",
