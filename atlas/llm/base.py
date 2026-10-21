@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from openai import OpenAI
+if TYPE_CHECKING:
+    from openai import OpenAI
 
 from ..providers import PROVIDERS
 from .contract import (ChatCallbacks, ChatCancelledError, ChatOptions, ChatResult,
@@ -17,6 +18,8 @@ class LLM:
 
     Injected SDK clients are borrowed. Internally created clients disable retries
     and are owned by this instance. Use bind_client for explicit replacement.
+    The provider SDK is loaded only when creating an internal client; importing
+    contracts or running an offline Agent does not initialize it.
     """
 
     def __init__(self, model: str | None = None, api_key: str | None = None,
@@ -24,12 +27,18 @@ class LLM:
                  *, client: OpenAI | None = None) -> None:
         preset = PROVIDERS.get(provider or "", {})
         self.model = model or os.getenv("ATLAS_MODEL") or preset.get("default_model") or "qwen-plus"
-        self.client = client if client is not None else OpenAI(
-            api_key=api_key or os.getenv("ATLAS_API_KEY"),
-            base_url=base_url or os.getenv("ATLAS_BASE_URL") or preset.get("base_url"),
-            max_retries=0,
-        )
-        self._owns_client = client is None
+        if client is None:
+            # Contracts and offline Agents must not initialize the provider SDK.
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=api_key or os.getenv("ATLAS_API_KEY"),
+                base_url=base_url or os.getenv("ATLAS_BASE_URL") or preset.get("base_url"),
+                max_retries=0,
+            )
+            self._owns_client = True
+        else:
+            self._owns_client = False
+        self.client = client
         self._closed = False
         # Backwards-compatible defaults for existing single-owner callers.
         # New integrations pass per-call options/callbacks instead.

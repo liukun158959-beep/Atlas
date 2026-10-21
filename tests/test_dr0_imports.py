@@ -46,3 +46,32 @@ def test_existing_top_level_exports_remain_available() -> None:
     for name in atlas.__all__:
         assert name in dir(atlas)
         assert getattr(atlas, name) is not None
+
+
+def test_offline_agent_and_borrowed_client_do_not_import_sdk() -> None:
+    result = subprocess.run([sys.executable, '-c', """
+import importlib.abc
+import sys
+from unittest.mock import Mock
+
+class NoSDK(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'openai' or fullname.startswith('openai.'):
+            raise AssertionError('Offline execution imported the provider SDK')
+
+sys.meta_path.insert(0, NoSDK())
+from atlas import Agent, LLM, Toolkit
+from atlas.llm import ChatOptions
+from atlas.testing import FakeLLM
+from atlas.journal import InMemoryJournal
+
+client = Mock()
+model = LLM(model='borrowed', client=client)
+model.close()
+client.close.assert_not_called()
+agent = Agent(llm=FakeLLM(['offline reply']), tools=Toolkit(),
+              journal=InMemoryJournal())
+assert agent.run('hello') == 'offline reply'
+assert 'openai' not in sys.modules
+"""], capture_output=True, text=True, cwd=ROOT, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
