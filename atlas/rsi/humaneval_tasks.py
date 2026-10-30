@@ -1,6 +1,7 @@
 """HumanEval 子集（MIT 改编）：编码 Prompt 打分与 atlas ab_test --preset humaneval。
 
 题意来自 OpenAI HumanEval（MIT License），手抄进仓库。
+原版权与完整许可保存在 atlas/licenses/HumanEval-MIT.txt。
 不安装 human-eval：官方 check 会在进程内 exec。
 """
 from __future__ import annotations

@@ -2,6 +2,7 @@
 name = "atlas"
 version = "0.1.0"
 description = "Atlas - 面向通用任务的 Agent 框架"
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0.0,<3",
@@ -22,6 +23,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["atlas*"]
+
+[tool.setuptools.package-data]
+atlas = ["licenses/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

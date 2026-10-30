@@ -185,3 +185,7 @@ Atlas 处于 **alpha（0.1.0）**，单人开发自用，API 可能变动。
 ## 技术栈
 
 Python 3.11+ · OpenAI 兼容协议（任意兼容模型可接入）· `pip` + `venv` · SQLite（默认 Journal）· `rich`（终端渲染）· `PyYAML`（声明式配置）· `pytest`（测试）· OpenTelemetry（可选观测）。
+
+## 许可证
+
+Atlas 自有代码采用 [MIT License](LICENSE)，允许使用、修改与再分发，需保留版权与许可声明。第三方内容及依赖保留原授权，见 [第三方声明](THIRD_PARTY_NOTICES.md)。
